@@ -748,6 +748,24 @@ async fn main() -> Result<()> {
             }),
         )
         .route(
+            "/vendor/marked.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/vendor/marked.js"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/purify.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/vendor/purify.js"),
+                )
+            }),
+        )
+        .route(
             "/tools.js",
             get(|| async {
                 (

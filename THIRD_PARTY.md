@@ -102,3 +102,5 @@ Rust 的分享只读视图与授权回调按官方协议独立实现：
 [aria2](https://github.com/aria2/aria2)，Docker 使用 Debian bookworm 的 `aria2=1.36.0-1` 软件包。aria2 按 GPL-2.0-or-later 独立分发，许可证与源码包见 [Debian 包页面](https://packages.debian.org/bookworm/aria2) 和镜像中的 `/usr/share/doc/aria2/copyright`。Rust 程序经本机 JSON-RPC 控制独立进程，不复制或链接其代码。公开源码包仅包含 FlowDisk 原创代码、构建文件与说明；重新分发镜像及 aria2 软件包时仍须遵守上游许可。
 
 [scraper](https://github.com/rust-scraper/scraper) 0.24.0（ISC）用于静态 HTML 解析、CSS 选择器及链接实体解码；不运行远程网页脚本。
+
+Markdown 桌面预览使用本地随包的 [marked](https://github.com/markedjs/marked) 18.1.1（MIT）与 [DOMPurify](https://github.com/cure53/DOMPurify) 3.4.17（MPL-2.0 OR Apache-2.0）。构建时不从 CDN 执行代码；分发文件来自 npm 官方 tarball，已核对 SHA-512 完整性，许可证位于 `web/vendor/`。渲染结果使用允许列表清理，禁止脚本、交互 HTML 和外部图片自动加载。

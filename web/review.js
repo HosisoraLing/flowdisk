@@ -7,7 +7,7 @@ function fileKind(name) {
   if(['jpg','jpeg','png','gif','webp','avif','bmp'].includes(ext))return 'image';
   if(['mp3','wav','flac','ogg','oga','m4a','aac'].includes(ext))return 'audio';
   if(['mp4','m4v','webm','mov','mkv'].includes(ext))return 'video';
-  if(['txt','md','json','csv','log','srt','ass','lrc','ini','toml','yaml','yml','xml','html','htm','svg','nfo','url'].includes(ext))return 'text';
+  if(['txt','md','markdown','json','csv','log','srt','ass','lrc','ini','toml','yaml','yml','xml','html','htm','svg','nfo','url'].includes(ext))return 'text';
   return 'other';
 }
 function within(root,path){return path===root||path.startsWith(root+'/');}
@@ -166,7 +166,12 @@ async function showFilePreview(path,name,endpoint){
       if(!response.ok){const err=await response.json().catch(()=>({}));throw Error(err.error||'文本预览失败');}
       const data=new Uint8Array(await response.arrayBuffer());if(controller.signal.aborted)return;
       let content;try{content=new TextDecoder('utf-8',{fatal:true}).decode(data,{stream:true});}catch{content=new TextDecoder('gb18030').decode(data);}
-      $('preview-content').replaceChildren(text('pre',content,'text-preview'));if(entry?.size>262144)$('preview-info').append(text('small','仅预览前 256 KB，下载可获得完整文本。'));
+      if(/\.(md|markdown)$/i.test(name)){
+        const article=text('article','','markdown-preview');
+        article.innerHTML=DOMPurify.sanitize(marked.parse(content),{ALLOWED_TAGS:['h1','h2','h3','h4','h5','h6','p','a','ul','ol','li','pre','code','em','strong','blockquote','hr','br','del','table','thead','tbody','tr','th','td'],ALLOWED_ATTR:['href','title','class','colspan','rowspan'],ALLOW_DATA_ATTR:false});
+        for(const link of article.querySelectorAll('a')){link.target='_blank';link.rel='noopener noreferrer';}
+        $('preview-content').replaceChildren(article);$('preview-info').append(text('small','Markdown 已渲染；内嵌脚本、原始图片及交互 HTML 已过滤。'));
+      }else $('preview-content').replaceChildren(text('pre',content,'text-preview'));if(entry?.size>262144)$('preview-info').append(text('small','仅预览前 256 KB，下载可获得完整文本。'));
     }catch(e){if(e.name!=='AbortError')$('preview-content').replaceChildren(text('p',e.message,'preview-placeholder'));}
   }else $('preview-content').append(text('div','此格式可下载原文件后打开。','preview-placeholder'));
 }

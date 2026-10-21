@@ -51,8 +51,8 @@ pub fn media(name: &str) -> (&'static str, &'static str) {
         "webm" => ("video", "video/webm"),
         "mov" => ("video", "video/quicktime"),
         "mkv" => ("video", "video/x-matroska"),
-        "txt" | "md" | "json" | "csv" | "log" | "srt" | "ass" | "lrc" | "ini" | "toml" | "yaml"
-        | "yml" | "xml" | "html" | "htm" | "svg" | "nfo" | "url" => {
+        "txt" | "md" | "markdown" | "json" | "csv" | "log" | "srt" | "ass" | "lrc" | "ini"
+        | "toml" | "yaml" | "yml" | "xml" | "html" | "htm" | "svg" | "nfo" | "url" => {
             ("text", "text/plain; charset=utf-8")
         }
         _ => ("other", "application/octet-stream"),
