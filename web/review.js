@@ -134,7 +134,7 @@ for(const id of ['share-search','share-type','share-scope'])$(id).addEventListen
 async function startReviewDownload(allowAds=false){
   $('share-download').disabled=true;
   try{
-    const result=await api('/shares/'+reviewId+'/download',{method:'POST',body:JSON.stringify({paths:[...reviewPicked],allow_ads:allowAds})});
+    const result=await api('/shares/'+reviewId+'/download',{method:'POST',body:JSON.stringify({paths:[...reviewPicked],allow_ads:allowAds,create_folder:$('share-create-folder').checked})});
     toast(`已将 ${result.jobs.length} 个文件加入同一下载组`);closeShare();setView('tasks');await loadJobs();await loadShares();
   }catch(e){toast(e.message);updateReviewSelection();}
 }

@@ -950,6 +950,7 @@ pub async fn enqueue_paths(
     app: &App,
     paths: Vec<String>,
     group: Option<(Uuid, String)>,
+    create_folder: bool,
 ) -> ApiResult<Vec<Uuid>> {
     let (group_id, group_name) = group.unwrap_or_else(|| {
         (
@@ -968,6 +969,8 @@ pub async fn enqueue_paths(
             },
         )
     });
+    let roots = paths.clone();
+    let mut single_directory = None;
     let mut pending = paths;
     let mut found = Vec::new();
     let mut visited = BTreeSet::new();
@@ -989,6 +992,9 @@ pub async fn enqueue_paths(
             }
             continue;
         }
+        if roots.len() == 1 && roots[0] == path {
+            single_directory = Some(path.clone());
+        }
         let list = app
             .0
             .gateway
@@ -1009,6 +1015,14 @@ pub async fn enqueue_paths(
         return Err(bad("所选目录中没有可下载的文件"));
     }
     let mut jobs = app.0.jobs.lock().await;
+    let folder = if create_folder && found.len() > 1 {
+        crate::local::batch_folder(&group_name, group_id)
+    } else {
+        String::new()
+    };
+    let common = single_directory.unwrap_or_else(|| {
+        crate::local::common_parent(&roots.iter().map(String::as_str).collect::<Vec<_>>())
+    });
     let mut ids = Vec::new();
     let mut fresh = Vec::new();
     let new_count = found
@@ -1024,7 +1038,7 @@ pub async fn enqueue_paths(
             job.group_name = Some(group_name.clone());
             ids.push(job.id);
             if job.status == "completed"
-                && !fs::try_exists(app.0.downloads.join(job.id.to_string()).join(&job.name)).await?
+                && !fs::try_exists(crate::local::job_file(app, job)).await?
             {
                 job.status = "paused".into();
                 job.downloaded = 0;
@@ -1035,10 +1049,24 @@ pub async fn enqueue_paths(
             }
             continue;
         }
+        let relative = path
+            .strip_prefix(&common)
+            .unwrap_or(&name)
+            .trim_start_matches('/');
+        let parent = relative.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let dir = [folder.as_str(), parent]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .map(safe_name_path)
+            .collect::<Vec<_>>()
+            .join("/");
+        crate::local::checked_path(&app.0.downloads, &dir, true).await?;
+        let output_name = crate::local::available_name(app, &jobs, &dir, &safe_name(&name)).await?;
         let job = Job {
             id: Uuid::new_v4(),
             path,
-            name: safe_name(&name),
+            name: output_name,
+            local_dir: Some(dir),
             status: "paused".into(),
             size: Some(size),
             downloaded: 0,
@@ -1062,6 +1090,9 @@ pub async fn enqueue_paths(
         app.start(id).await?;
     }
     Ok(ids)
+}
+fn safe_name_path(path: &str) -> String {
+    path.split('/').map(safe_name).collect::<Vec<_>>().join("/")
 }
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()

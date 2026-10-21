@@ -29,3 +29,5 @@
 限速参数按 bytes/s，0 表示不限速；与网页界面的 KiB/s 单位不同。工具调用复用工作台 API 的路径、文件选择、容量、广告及活动任务校验，不开放任意 HTTP 代理、任意文件读写或命令执行。
 
 MCP 令牌拥有当前可信用户的工作台权限。只读工具带 `readOnlyHint`；添加任务和修改设置会产生真实操作，客户端应向用户展示工具调用。分享需先浏览并选择，转存需 `confirm_transfer:true`；不要由模型自行代替用户作出空间消耗或广告保留决定。
+
+`flowdisk_download_link`、`flowdisk_download_paths` 和 `flowdisk_download_share` 接受可选的 `create_folder`，默认 `true`。设为 `false` 可取消额外的批次文件夹；源内容的子目录结构仍保留。

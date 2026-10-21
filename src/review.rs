@@ -254,6 +254,8 @@ struct Choice {
     paths: Vec<String>,
     #[serde(default)]
     allow_ads: bool,
+    #[serde(default = "crate::local::yes")]
+    create_folder: bool,
 }
 async fn download(
     State(app): State<App>,
@@ -304,7 +306,7 @@ async fn download(
     );
     // Enqueue the reviewed snapshot, not newly appeared files inside a folder.
     let paths = chosen.iter().map(|e| e.path.clone()).collect();
-    let ids = control::enqueue_paths(&app, paths, Some((id, name))).await?;
+    let ids = control::enqueue_paths(&app, paths, Some((id, name)), choice.create_folder).await?;
     {
         let mut jobs = app.0.jobs.lock().await;
         for job in jobs.values_mut().filter(|j| ids.contains(&j.id)) {
@@ -400,9 +402,14 @@ async fn preview(app: &App, path: &str, headers: &HeaderMap, head: bool) -> ApiR
         .await
         .values()
         .find(|job| job.path == path && job.status == "completed")
-        .map(|job| (job.id, job.name.clone()));
-    if let Some((id, name)) = cached {
-        let local = app.0.downloads.join(id.to_string()).join(&name);
+        .map(|job| (crate::local::job_file(app, job), job.name.clone()));
+    if let Some((local, name)) = cached {
+        crate::local::checked_path(
+            &app.0.downloads,
+            &crate::local::relative(&app.0.downloads, &local)?,
+            true,
+        )
+        .await?;
         if let Ok(meta) = tokio::fs::symlink_metadata(&local).await
             && meta.file_type().is_file()
         {

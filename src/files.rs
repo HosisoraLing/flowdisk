@@ -13,7 +13,24 @@ use std::path::PathBuf;
 use tokio::fs;
 use uuid::Uuid;
 
-async fn local_path(app: &App, id: Uuid) -> ApiResult<PathBuf> {
+pub(crate) async fn local_path(app: &App, id: Uuid) -> ApiResult<PathBuf> {
+    let job = app.0.jobs.lock().await.get(&id).cloned();
+    local_path_for(app, id, job.as_ref()).await
+}
+async fn local_path_for(app: &App, id: Uuid, job: Option<&crate::Job>) -> ApiResult<PathBuf> {
+    if let Some(job) = job {
+        let path = crate::local::job_file(app, job);
+        crate::local::checked_path(
+            &app.0.downloads,
+            &crate::local::relative(&app.0.downloads, &path)?,
+            false,
+        )
+        .await?;
+        if fs::symlink_metadata(&path).await?.is_file() {
+            return Ok(path);
+        }
+        return Err(bad("文件尚未完成或已经删除"));
+    }
     let dir = app.0.downloads.join(id.to_string());
     let meta = fs::symlink_metadata(&dir)
         .await
@@ -46,7 +63,7 @@ async fn local_list(State(app): State<App>) -> ApiResult<Json<Value>> {
         if running.contains_key(&id) || !entry.file_type().await?.is_dir() {
             continue;
         }
-        let Ok(path) = local_path(&app, id).await else {
+        let Ok(path) = local_path_for(&app, id, jobs.get(&id)).await else {
             continue;
         };
         let meta = fs::metadata(&path).await?;
@@ -57,6 +74,20 @@ async fn local_list(State(app): State<App>) -> ApiResult<Json<Value>> {
             .map(|d| d.as_secs());
         files.push(json!({"id":id,"name":path.file_name().unwrap().to_string_lossy(),"size":meta.len(),"modified":modified,"sha256":jobs.get(&id).and_then(|j|j.sha256.clone()),"source":jobs.get(&id).map(|j|j.path.clone()),"passwords":jobs.get(&id).map(|j|j.passwords.clone()).unwrap_or_default()}));
     }
+    for job in jobs
+        .values()
+        .filter(|j| j.local_dir.is_some() && j.status == "completed")
+    {
+        if files.iter().any(|f| f["id"] == job.id.to_string()) {
+            continue;
+        }
+        let path = crate::local::job_file(&app, job);
+        if let Ok(meta) = fs::symlink_metadata(&path).await
+            && meta.is_file()
+        {
+            files.push(json!({"id":job.id,"name":job.name,"size":meta.len(),"sha256":job.sha256,"passwords":job.passwords}));
+        }
+    }
     files.sort_by_key(|v| std::cmp::Reverse(v["modified"].as_u64().unwrap_or(0)));
     Ok(Json(json!(files)))
 }
@@ -66,6 +97,7 @@ async fn local_file(
     headers: HeaderMap,
     method: axum::http::Method,
 ) -> ApiResult<Response> {
+    let _guard = app.0.control.file_lock.lock().await;
     if app.0.running.lock().await.contains_key(&id) {
         return Err(bad("文件仍在下载中"));
     }
@@ -82,55 +114,14 @@ async fn local_rename(
     Path(id): Path<Uuid>,
     Json(input): Json<Rename>,
 ) -> ApiResult<Json<Value>> {
-    if !valid_name(&input.name)
-        || input.name.len() > 200
-        || crate::safe_name(&input.name) != input.name
-    {
-        return Err(bad("文件名不能含路径或控制字符，且最多 200 个 UTF-8 字节"));
-    }
-    let _lock = app.0.control.file_lock.lock().await;
-    let running = app.0.running.lock().await;
-    if running.contains_key(&id) {
-        return Err(bad("请等待下载完成"));
-    }
-    let path = local_path(&app, id).await?;
-    let target = path.with_file_name(&input.name);
-    if target == path {
-        return Ok(Json(json!({"ok":true})));
-    }
-    if fs::try_exists(&target).await? {
-        return Err(bad("同名文件已存在"));
-    }
-    fs::rename(&path, &target).await?;
-    let mut jobs = app.0.jobs.lock().await;
-    if let Some(job) = jobs.get_mut(&id) {
-        let old = job.name.clone();
-        job.name = input.name;
-        if let Err(error) = app.save(&jobs).await {
-            if let Some(job) = jobs.get_mut(&id) {
-                job.name = old;
-            }
-            let _ = fs::rename(&target, &path).await;
-            return Err(error.into());
-        }
-    }
+    crate::local::rename_job(&app, id, input.name).await?;
     Ok(Json(json!({"ok":true})))
 }
 async fn local_delete(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
-    let _lock = app.0.control.file_lock.lock().await;
-    let running = app.0.running.lock().await;
-    if running.contains_key(&id) {
-        return Err(bad("请先暂停下载，再删除本地文件"));
-    }
-    let path = local_path(&app, id).await?;
-    fs::remove_file(path).await?;
-    let dir = app.0.downloads.join(id.to_string());
-    let _ = fs::remove_dir(dir).await;
-    let mut jobs = app.0.jobs.lock().await;
-    jobs.remove(&id);
-    app.save(&jobs).await?;
+    crate::local::delete_job(&app, id).await?;
     Ok(Json(json!({"ok":true})))
 }
+
 #[derive(Deserialize)]
 struct CloudOperation {
     action: String,
@@ -260,6 +251,8 @@ async fn cloud_operation(
 #[derive(Deserialize)]
 struct Batch {
     paths: Vec<String>,
+    #[serde(default = "crate::local::yes")]
+    create_folder: bool,
 }
 async fn batch_download(
     State(app): State<App>,
@@ -268,11 +261,22 @@ async fn batch_download(
     if input.paths.is_empty() || input.paths.len() > 100 {
         return Err(bad("请选择 1–100 项文件或文件夹"));
     }
-    let group = (
-        Uuid::new_v4(),
-        format!("批量下载 · {} 项", input.paths.len()),
-    );
-    let ids = crate::control::enqueue_paths(&app, input.paths, Some(group)).await?;
+    let _guard = app.0.control.file_lock.lock().await;
+    let name = if input.paths.len() == 1 {
+        format!(
+            "下载 · {}",
+            input.paths[0]
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("文件")
+        )
+    } else {
+        format!("批量下载 · {} 项", input.paths.len())
+    };
+    let group = (Uuid::new_v4(), name);
+    let ids =
+        crate::control::enqueue_paths(&app, input.paths, Some(group), input.create_folder).await?;
     Ok(Json(json!({"jobs":ids})))
 }
 #[derive(Deserialize)]
@@ -304,6 +308,7 @@ pub fn routes() -> Router<App> {
             "/files/upload",
             put(cloud_upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
+        .merge(crate::local::routes())
         .route("/local", get(local_list))
         .route("/local/{id}", axum::routing::delete(local_delete))
         .route("/local/{id}/rename", post(local_rename))

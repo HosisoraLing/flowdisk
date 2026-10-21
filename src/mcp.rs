@@ -52,7 +52,7 @@ fn tools() -> Vec<Value> {
         tool(
             "flowdisk_download_link",
             "添加一个普通下载链接或磁力。种子内容等待用户明确选择；不能绕过账号权限",
-            json!({"uri":{"type":"string"},"group_name":{"type":"string"}}),
+            json!({"uri":{"type":"string"},"group_name":{"type":"string"},"create_folder":{"type":"boolean","default":true}}),
             &["uri"],
             false,
             false,
@@ -84,7 +84,7 @@ fn tools() -> Vec<Value> {
         tool(
             "flowdisk_download_share",
             "下载用户选中的分享文件；若含疑似广告需用户明确保留",
-            json!({"id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"maxItems":5000},"allow_ads":{"type":"boolean"}}),
+            json!({"id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"maxItems":5000},"allow_ads":{"type":"boolean"},"create_folder":{"type":"boolean","default":true}}),
             &["id", "paths"],
             false,
             false,
@@ -92,7 +92,7 @@ fn tools() -> Vec<Value> {
         tool(
             "flowdisk_download_paths",
             "批量下载已存网盘或 SMB 文件/目录",
-            json!({"paths":{"type":"array","items":{"type":"string"},"maxItems":1000}}),
+            json!({"paths":{"type":"array","items":{"type":"string"},"maxItems":1000},"create_folder":{"type":"boolean","default":true}}),
             &["paths"],
             false,
             false,
@@ -235,7 +235,9 @@ async fn call(app: &App, name: &str, args: Value) -> Result<Value, String> {
         "flowdisk_download_share" => (
             Method::POST,
             format!("/shares/{}/download", id(&args)?),
-            Some(json!({"paths":args["paths"],"allow_ads":args["allow_ads"]==true})),
+            Some(
+                json!({"paths":args["paths"],"allow_ads":args["allow_ads"]==true,"create_folder":args["create_folder"].as_bool().unwrap_or(true)}),
+            ),
         ),
         "flowdisk_download_paths" => (Method::POST, "/batch-download".into(), Some(args)),
         "flowdisk_select_torrent" => (

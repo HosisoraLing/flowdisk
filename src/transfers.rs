@@ -33,10 +33,14 @@ pub struct TransferFile {
     pub length: u64,
     pub completed: u64,
     pub selected: bool,
+    #[serde(default)]
+    pub local_path: Option<String>,
+    #[serde(default)]
+    pub local_deleted: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Transfer {
-    id: Uuid,
+    pub(crate) id: Uuid,
     gid: String,
     uri: String,
     headers: BTreeMap<String, String>,
@@ -56,7 +60,7 @@ pub struct Transfer {
     seed_ms: u64,
     pub kind: String,
     pub name: String,
-    status: String,
+    pub(crate) status: String,
     pub files: Vec<TransferFile>,
     group_id: Uuid,
     group_name: String,
@@ -71,7 +75,9 @@ pub struct Transfer {
     last_received: u64,
     last_sent: u64,
     #[serde(default)]
-    hidden: bool,
+    pub(crate) hidden: bool,
+    #[serde(default)]
+    pub(crate) destination: Option<String>,
     #[serde(flatten)]
     stats: SpeedStats,
 }
@@ -152,6 +158,23 @@ impl Transfers {
             Err(e) => return Err(e.into()),
         };
         for t in tasks.values_mut() {
+            if let Some(dir) = &t.destination {
+                crate::local::valid_relative(dir)?;
+            }
+            for f in &t.files {
+                ensure!(
+                    !FsPath::new(&f.name).components().any(|p| matches!(
+                        p,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )),
+                    "本地文件路径无效"
+                );
+                if let Some(path) = &f.local_path {
+                    crate::local::valid_relative(path)?;
+                }
+            }
             if !matches!(t.status.as_str(), "completed" | "failed" | "selecting") {
                 t.status = "paused".into();
             }
@@ -263,7 +286,7 @@ impl Transfers {
         }
         v.get("result").cloned().context("引擎未返回结果")
     }
-    async fn persist(&self, tasks: &BTreeMap<Uuid, Transfer>) -> Result<()> {
+    pub(crate) async fn persist(&self, tasks: &BTreeMap<Uuid, Transfer>) -> Result<()> {
         save(&self.path, tasks).await
     }
     pub async fn public(&self) -> Vec<Value> {
@@ -312,7 +335,10 @@ impl Transfers {
         }
         let mut tasks = self.tasks.lock().await;
         let mut downloading = false;
-        for t in tasks.values_mut().filter(|t| !t.hidden) {
+        for t in tasks
+            .values_mut()
+            .filter(|t| !t.hidden && t.status != "completed")
+        {
             let Ok(mut v) = self.rpc("tellStatus", json!([t.gid])).await else {
                 continue;
             };
@@ -399,7 +425,7 @@ impl Transfers {
                 None
             };
             if let Some(files) = v["files"].as_array() {
-                let root = self.downloads.join(t.id.to_string());
+                let root = self.task_dir(t);
                 let mut list = vec![];
                 for f in files {
                     let full = PathBuf::from(f["path"].as_str().unwrap_or(""));
@@ -421,6 +447,14 @@ impl Transfers {
                                 length: number(f, "length"),
                                 completed: number(f, "completedLength"),
                                 selected: f["selected"] == "true",
+                                local_path: t
+                                    .files
+                                    .iter()
+                                    .find(|old| old.index == number(f, "index"))
+                                    .and_then(|old| old.local_path.clone()),
+                                local_deleted: t.files.iter().any(|old| {
+                                    old.index == number(f, "index") && old.local_deleted
+                                }),
                             });
                         }
                     }
@@ -467,8 +501,16 @@ impl Transfers {
         self.downloading.store(downloading, Ordering::Relaxed);
         self.persist(&tasks).await
     }
+    fn task_dir(&self, task: &Transfer) -> PathBuf {
+        task.destination
+            .as_ref()
+            .map(|p| self.downloads.parent().unwrap().join(p))
+            .unwrap_or_else(|| self.downloads.join(task.id.to_string()))
+    }
     async fn add(&self, task: &Transfer, paused: bool) -> Result<()> {
-        let folder = self.downloads.join(task.id.to_string());
+        let folder = self.task_dir(task);
+        let root = self.downloads.parent().context("下载根目录无效")?;
+        crate::local::checked_path(root, &crate::local::relative(root, &folder)?, true).await?;
         fs::create_dir_all(&folder).await?;
         let mut options = json!({"gid":task.gid,"dir":folder.to_string_lossy(),"pause":if paused{"true"}else{"false"},"header":task.headers.iter().map(|(k,v)|format!("{k}: {v}")).collect::<Vec<_>>(),"pause-metadata":"true","follow-torrent":"true","follow-metalink":"false"});
         if !matches!(task.kind.as_str(), "torrent" | "magnet") {
@@ -520,8 +562,11 @@ struct Input {
     name: String,
     group_id: Option<Uuid>,
     group_name: Option<String>,
+    #[serde(default = "crate::local::yes")]
+    create_folder: bool,
 }
 async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<Json<Value>> {
+    let _guard = app.0.control.file_lock.lock().await;
     if !app.0.transfers.available() {
         return Err(bad("链接下载引擎不可用，请使用含 aria2 的 Docker 镜像"));
     }
@@ -589,7 +634,12 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
         .group_name
         .filter(|s| s.len() <= 200)
         .unwrap_or_else(|| "链接下载".into());
-    let task = Transfer {
+    let destination = if input.create_folder {
+        crate::local::batch_folder(&group_name, group_id)
+    } else {
+        String::new()
+    };
+    let mut task = Transfer {
         id,
         gid: gid.clone(),
         uri: input.uri.trim().into(),
@@ -614,6 +664,7 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
         files: vec![],
         group_id,
         group_name,
+        destination: Some(destination),
         created_at: now(),
         error: None,
         downloaded: 0,
@@ -630,6 +681,20 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
     let mut tasks = app.0.transfers.tasks.lock().await;
     if tasks.len() >= 2000 {
         return Err(bad("最多保留 2000 个链接任务，请清理旧任务和本地文件"));
+    }
+    if !matches!(task.kind.as_str(), "torrent" | "magnet") {
+        let directory = app.0.transfers.task_dir(&task);
+        if fs::try_exists(directory.join(&task.name)).await?
+            || tasks
+                .values()
+                .any(|t| app.0.transfers.task_dir(t) == directory && t.name == task.name)
+        {
+            task.name = format!(
+                "{}-{}",
+                &id.simple().to_string()[..8],
+                task.name.chars().take(60).collect::<String>()
+            );
+        }
     }
     tasks.insert(id, task.clone());
     app.0.transfers.persist(&tasks).await?;
@@ -755,6 +820,7 @@ async fn remove(
     Path(id): Path<Uuid>,
     Query(q): Query<Remove>,
 ) -> ApiResult<Json<Value>> {
+    let _guard = app.0.control.file_lock.lock().await;
     let mut tasks = app.0.transfers.tasks.lock().await;
     let task = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
     if matches!(
@@ -770,9 +836,21 @@ async fn remove(
         .rpc("removeDownloadResult", json!([task.gid]))
         .await;
     if q.delete_files {
+        for f in &task.files {
+            let path = crate::local::transfer_file(&app, task, f);
+            let relative = crate::local::relative(&app.0.downloads, &path)?;
+            crate::local::checked_path(&app.0.downloads, &relative, true).await?;
+            if fs::try_exists(&path).await? {
+                fs::remove_file(path).await?;
+            }
+        }
         let dir = app.0.transfers.downloads.join(id.to_string());
-        if fs::try_exists(&dir).await? {
+        if task.destination.is_none() && fs::try_exists(&dir).await? {
             fs::remove_dir_all(dir).await?;
+        } else if let Some(dir) = &task.destination
+            && !dir.is_empty()
+        {
+            let _ = fs::remove_dir(app.0.downloads.join(dir)).await;
         }
         tasks.remove(&id);
     } else {
@@ -789,6 +867,7 @@ async fn file(
     headers: HeaderMap,
     method: Method,
 ) -> ApiResult<Response> {
+    let _guard = app.0.control.file_lock.lock().await;
     let tasks = app.0.transfers.tasks.lock().await;
     let task = tasks.get(&id).ok_or_else(|| bad("任务不存在"))?;
     let f = task
@@ -796,20 +875,31 @@ async fn file(
         .iter()
         .find(|f| f.index == index)
         .ok_or_else(|| bad("文件不存在"))?;
-    if f.completed != f.length
+    if f.local_deleted
+        || f.completed != f.length
         || !matches!(task.status.as_str(), "completed" | "seeding" | "paused")
     {
         return Err(bad("文件仍在下载或校验中"));
     }
-    let root = app.0.transfers.downloads.join(id.to_string());
-    let path = root.join(&f.name);
+    let root = app.0.transfers.task_dir(task);
+    let path = f
+        .local_path
+        .as_ref()
+        .map(|p| app.0.downloads.join(p))
+        .unwrap_or_else(|| root.join(&f.name));
     let name = path
         .file_name()
         .context("文件名无效")?
         .to_string_lossy()
         .to_string();
     let real = fs::canonicalize(&path).await?;
-    if !real.starts_with(fs::canonicalize(&root).await?)
+    crate::local::checked_path(
+        &app.0.downloads,
+        &crate::local::relative(&app.0.downloads, &path)?,
+        false,
+    )
+    .await?;
+    if !real.starts_with(fs::canonicalize(&app.0.downloads).await?)
         || fs::symlink_metadata(&path).await?.file_type().is_symlink()
     {
         return Err(bad("本地文件路径无效"));
@@ -822,7 +912,8 @@ async fn files(State(app): State<App>) -> Json<Value> {
     let mut files = vec![];
     for t in tasks.values() {
         for f in &t.files {
-            if f.completed == f.length
+            if !f.local_deleted
+                && f.completed == f.length
                 && matches!(t.status.as_str(), "completed" | "seeding" | "paused")
             {
                 files.push(json!({"id":t.id,"index":f.index,"name":f.name,"size":f.length,"seeding":t.status=="seeding","url":format!("/api/transfers/{}/files/{}",t.id,f.index)}));

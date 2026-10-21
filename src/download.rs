@@ -133,7 +133,14 @@ pub async fn run(
         .cloned()
         .context("任务不存在")?;
     let parts = app.0.data.join("parts").join(id.to_string());
-    let output_dir = app.0.downloads.join(id.to_string());
+    let output_path = crate::local::job_file(app, &job);
+    let output_dir = output_path.parent().context("下载目录无效")?.to_path_buf();
+    crate::local::checked_path(
+        &app.0.downloads,
+        &crate::local::relative(&app.0.downloads, &output_dir)?,
+        true,
+    )
+    .await?;
     fs::create_dir_all(&parts).await?;
     fs::create_dir_all(&output_dir).await?;
     let mut last_error = None;
@@ -243,7 +250,7 @@ pub async fn run(
             if cancel.is_cancelled() {
                 bail!("已暂停");
             }
-            let temp = output_dir.join(".assembling");
+            let temp = output_dir.join(format!(".assembling-{id}"));
             let mut output = fs::File::create(&temp).await?;
             let mut hasher = Sha256::new();
             let files: Vec<PathBuf> = if probe.ranged {
@@ -271,7 +278,7 @@ pub async fn run(
             ensure!(total == manifest.size, "文件合并长度不匹配");
             output.sync_all().await?;
             drop(output);
-            fs::rename(temp, output_dir.join(&job.name)).await?;
+            crate::local::rename_exclusive(&temp, &output_path).await?;
             // Failure to clean scratch files must not turn a valid download into a failure.
             if let Err(err) = fs::remove_dir_all(&parts).await {
                 eprintln!("临时分段清理失败: {err}");

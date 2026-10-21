@@ -7,6 +7,7 @@ mod external;
 mod files;
 mod gateway;
 mod links;
+mod local;
 mod mcp;
 mod review;
 mod serve_file;
@@ -126,6 +127,8 @@ struct Job {
     id: Uuid,
     path: String,
     name: String,
+    #[serde(default)]
+    local_dir: Option<String>,
     status: String,
     size: Option<u64>,
     downloaded: u64,
@@ -419,18 +422,20 @@ struct NewJob {
     path: String,
 }
 async fn create(State(app): State<App>, Json(new): Json<NewJob>) -> ApiResult<Json<Value>> {
+    let _guard = app.0.control.file_lock.lock().await;
     if !valid_path(&new.path) {
         return Err(bad("文件路径不合法"));
     }
     let meta = app.0.gateway.metadata(&new.path).await?;
     if meta.is_dir {
-        let ids = control::enqueue_paths(&app, vec![new.path], None).await?;
+        let ids = control::enqueue_paths(&app, vec![new.path], None, true).await?;
         return Ok(Json(json!({"jobs":ids})));
     }
     let job = Job {
         id: Uuid::new_v4(),
         path: new.path,
         name: safe_name(&meta.name),
+        local_dir: None,
         status: "paused".into(),
         size: Some(meta.size),
         downloaded: 0,
@@ -493,8 +498,14 @@ async fn remove(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<
             fs::remove_dir_all(parts).await?;
         }
         let output = app.0.downloads.join(id.to_string());
-        if fs::try_exists(&output).await? {
+        if job.local_dir.is_none() && fs::try_exists(&output).await? {
             fs::remove_dir_all(output).await?;
+        } else if let Some(dir) = &job.local_dir {
+            let dir = local::checked_path(&app.0.downloads, dir, true).await?;
+            let temp = dir.join(format!(".assembling-{id}"));
+            if fs::try_exists(&temp).await? {
+                fs::remove_file(temp).await?;
+            }
         }
     }
     jobs.remove(&id);
@@ -507,6 +518,7 @@ async fn file(
     headers: HeaderMap,
     method: axum::http::Method,
 ) -> ApiResult<Response> {
+    let _guard = app.0.control.file_lock.lock().await;
     let job = app
         .0
         .jobs
@@ -518,7 +530,13 @@ async fn file(
     if job.status != "completed" {
         return Err(bad("文件尚未完成"));
     }
-    let path = app.0.downloads.join(id.to_string()).join(&job.name);
+    let path = local::job_file(&app, &job);
+    local::checked_path(
+        &app.0.downloads,
+        &local::relative(&app.0.downloads, &path)?,
+        false,
+    )
+    .await?;
     serve_file::send(
         &path,
         &job.name,
@@ -578,6 +596,9 @@ async fn main() -> Result<()> {
     };
     for job in saved.values_mut() {
         ensure!(safe_name(&job.name) == job.name, "任务记录文件名不合法");
+        if let Some(dir) = &job.local_dir {
+            local::valid_relative(dir)?;
+        }
         job.speed = 0;
         job.connections = 0;
         if matches!(job.status.as_str(), "queued" | "downloading" | "pausing") {
@@ -631,6 +652,7 @@ async fn main() -> Result<()> {
         bandwidth,
         telemetry,
     }));
+    local::recover(&app).await?;
     app.save(&*app.0.jobs.lock().await).await?;
     let monitor = app.clone();
     tokio::spawn(async move {
@@ -804,6 +826,15 @@ async fn main() -> Result<()> {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../web/vendor/purify.js"),
+                )
+            }),
+        )
+        .route(
+            "/local.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/local.js"),
                 )
             }),
         )

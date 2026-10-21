@@ -94,7 +94,7 @@ $('search').oninput = renderFiles;
 $('refresh').onclick = async () => { await loadRoots(); await browse(currentPath,page,true); };
 $('previous').onclick = () => browse(currentPath,page-1); $('next').onclick = () => browse(currentPath,page+1);
 async function enqueue(path, quiet = false) { try { await api('/jobs',{method:'POST',body:JSON.stringify({path})}); if(!quiet) toast('已添加到下载任务'); await loadJobs(); return true; } catch(e) { toast(e.message); return false; } }
-$('download-selected').onclick=async()=>{try{const result=await api('/batch-download',{method:'POST',body:JSON.stringify({paths:[...selected].map(join)})});selected.clear();renderFiles();await loadJobs();toast(`已添加 ${result.jobs.length} 个下载任务`);}catch(e){toast(e.message);}};
+$('download-selected').onclick=async()=>{try{const result=await api('/batch-download',{method:'POST',body:JSON.stringify({paths:[...selected].map(join),create_folder:$('cloud-create-folder').checked})});selected.clear();renderFiles();await loadJobs();toast(`已添加 ${result.jobs.length} 个下载任务`);}catch(e){toast(e.message);}};
 let transferIds=new Set();
 async function jobAction(id,action) { try { await api(`/${transferIds.has(id)?'transfers':'jobs'}/${id}${action ? '/'+action : ''}`,{method:action?'POST':'DELETE'}); await loadJobs(); } catch(e) { toast(e.message); } }
 function speedChart(job) {
@@ -284,13 +284,6 @@ $('mkdir').onclick=()=>{const name=prompt('新文件夹名称');if(name)cloudOpe
 $('rename-cloud').onclick=()=>{const old=[...selected][0];if(!old)return;const name=prompt('新的名称',old);if(name&&name!==old)cloudOperation({action:'rename',path:join(old),name});};
 $('move-cloud').onclick=()=>{const destination=prompt('目标文件夹路径（同一网盘），例如 /quark/资料');if(destination)cloudOperation({action:'move',path:currentPath,names:[...selected],destination});};
 $('delete-cloud').onclick=()=>{if(selected.size&&confirm(`从网盘删除选中的 ${selected.size} 项内容？文件夹内的内容也将删除。`))cloudOperation({action:'delete',path:currentPath,names:[...selected]});};
-async function loadLocal(){
-  const files=await api('/local');$('local-files').replaceChildren();
-  if(typeof appendTransferFiles==='function')await appendTransferFiles();
-  if(!files.length&&!$('local-files').children.length){$('local-files').append(text('div','还没有已完成的本地文件。','empty'));return;}
-  for(const file of files){const row=text('article','','account-row');const info=text('div');info.append(text('strong',file.name),text('p',bytes(file.size)+' · '+(file.modified?new Date(file.modified*1000).toLocaleString('zh-CN'):'时间未知')));if(file.sha256)info.append(text('small','SHA-256 '+file.sha256,'checksum'));if(file.passwords?.length)info.append(passwordNotes(file.passwords));const actions=text('div','','task-actions');const link=text('a','保存到设备');link.href='/api/local/'+file.id+'/file';link.download=file.name;actions.append(link,button('重命名',async()=>{const name=prompt('新的文件名',file.name);if(!name||name===file.name)return;try{await api('/local/'+file.id+'/rename',{method:'POST',body:JSON.stringify({name})});await loadLocal();await loadJobs();}catch(e){toast(e.message);}}),button('删除',async()=>{if(!confirm('删除服务器本地文件“'+file.name+'”？网盘原文件会保留。'))return;try{await api('/local/'+file.id,{method:'DELETE'});await loadLocal();await loadJobs();}catch(e){toast(e.message);}}));row.append(info,actions);$('local-files').append(row);}
-}
-$('refresh-local').onclick=()=>loadLocal().catch(e=>toast(e.message));
 
 initialize();
 
