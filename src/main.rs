@@ -750,6 +750,46 @@ async fn main() -> Result<()> {
             }),
         )
         .route(
+            "/licenses",
+            get(|| async { Html(include_str!("../web/licenses.html")) }),
+        )
+        .route(
+            "/license.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../LICENSE"),
+                )
+            }),
+        )
+        .route(
+            "/third-party-licenses.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../THIRD_PARTY_LICENSES.txt"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/marked-LICENSE.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../web/vendor/marked-LICENSE.txt"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/purify-LICENSE.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../web/vendor/purify-LICENSE.txt"),
+                )
+            }),
+        )
+        .route(
             "/vendor/marked.js",
             get(|| async {
                 (
