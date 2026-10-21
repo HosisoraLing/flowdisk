@@ -22,7 +22,7 @@ async function initialize() {
     $('connection').textContent = status.gateway_connected ? '网盘网关已连接' : '网盘网关待配置';
     $('thread-setting').textContent = `每文件最多 ${status.threads} 连接`;
     if(!status.gateway_connected) toast(status.gateway_error || '请先配置 OpenList 网盘');
-    await loadAccounts(); await loadSmb(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares();
+    await loadAccounts(); await loadSmb(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares(); if(typeof loadTools==='function')await loadTools();
     clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(view==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(()=>{}); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
   } catch(e) { if(!$('workspace').hidden) toast(e.message); else { loginView(); $('login-error').textContent = e.message === '请先登录' ? '' : e.message; } }
 }
@@ -33,13 +33,13 @@ $('login-form').onsubmit = async event => {
 $('logout').onclick = async () => { await api('/logout',{method:'POST'}); loginView(); };
 function setView(next) {
   view = next;
-  for(const name of ['browse','tasks','local','accounts','links','statistics']) { $(name+'-view').hidden = next !== name; $(name+'-tab').classList.toggle('active',next===name); }
+  for(const name of ['browse','tasks','local','accounts','statistics']) { $(name+'-view').hidden = next !== name; $(name+'-tab').classList.toggle('active',next===name); }
   if(next==='local') loadLocal().catch(e=>toast(e.message));
   if(next==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(e=>toast(e.message));
-  if(next==='links'&&typeof loadTools==='function')loadTools().catch(e=>toast(e.message));
+  if(next==='browse'&&typeof loadTools==='function')loadTools().catch(e=>toast(e.message));
   if(next==='accounts') loadAccounts().catch(e=>toast(e.message));
 }
-for(const name of ['browse','tasks','local','accounts','links','statistics']) $(name+'-tab').onclick=()=>setView(name);
+for(const name of ['browse','tasks','local','accounts','statistics']) $(name+'-tab').onclick=()=>setView(name);
 function join(name) { return currentPath.replace(/\/$/,'') + '/' + name; }
 async function loadRoots() { try { const result = await api('/browse?path=%2F'); roots = result.content || []; } catch { roots = []; } renderDrives(); }
 function renderDrives() {
@@ -263,10 +263,6 @@ async function applyLoginStatus(s) {
 }
 async function endLogin(){++loginRevision;clearInterval(loginPoll);$('account-content').replaceChildren();const s=loginSession;loginSession=null;if(s)api('/logins/'+s.id,{method:'DELETE'}).catch(()=>{});}
 $('close-account').onclick=()=>{$('account-dialog').close();endLogin();};$('account-dialog').addEventListener('cancel',()=>endLogin());
-$('share-form').onsubmit=async event=>{
-  event.preventDefault();$('share-submit').disabled=true;
-  try{const s=await api('/shares',{method:'POST',body:JSON.stringify({url:$('share-url').value,passcode:$('share-code').value.trim()})});$('share-url').value='';$('share-code').value='';await loadShares();const account=accounts.find(a=>a.id===s.provider);if(account&&!account.connected)await openAccount(account.id);else await openShare(s.id);}catch(e){toast(e.message);}finally{$('share-submit').disabled=false;}
-};
 async function loadShares(){
   const shares=await api('/shares');$('share-requests').replaceChildren();
   for(const s of shares.slice(0,12)){
