@@ -5,6 +5,7 @@ mod download;
 mod external;
 mod files;
 mod gateway;
+mod links;
 mod review;
 mod serve_file;
 mod thunder;
@@ -644,6 +645,7 @@ async fn main() -> Result<()> {
         .merge(files::routes())
         .merge(review::routes())
         .merge(transfers::routes())
+        .merge(links::routes())
         .route("/status", get(status))
         .route("/browse", get(browse))
         .route("/jobs", get(jobs).post(create))
