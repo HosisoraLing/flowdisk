@@ -77,7 +77,7 @@ pub struct Transfer {
 }
 impl Transfer {
     fn public(&self) -> Value {
-        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if matches!(self.status.as_str(),"downloading"|"seeding"){self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"peers":self.peers,"seeders":self.seeders,"pieces":self.pieces,"completed_pieces":self.completed_pieces,"seed_ms":self.seed_ms,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
+        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if matches!(self.status.as_str(),"downloading"|"seeding"){self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"peers":self.peers,"seeders":self.seeders,"pieces":self.pieces,"completed_pieces":self.completed_pieces,"seed_ms":self.seed_ms,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"average_upload_speed":(self.uploaded as u128*1000/self.stats.active_ms.max(1) as u128).min(u64::MAX as u128) as u64,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
     }
 }
 pub struct Transfers {
@@ -366,7 +366,7 @@ impl Transfers {
                 .unwrap_or(0)
                 .min(t.pieces);
             let received = completed.saturating_sub(t.last_received);
-            t.last_received = completed;
+            t.last_received = t.last_received.max(completed);
             let sent = number(&v, "uploadLength");
             let delta_sent = if sent >= t.last_sent {
                 sent - t.last_sent
@@ -445,6 +445,12 @@ impl Transfers {
                         .filter(|f| f.selected)
                         .map(|f| f.completed)
                         .sum();
+                    if status == "active" && t.approved && t.size > 0 && t.downloaded >= t.size {
+                        if t.status != "seeding" {
+                            t.seed_ms = t.seed_ms.saturating_add(elapsed_ms);
+                        }
+                        t.status = "seeding".into();
+                    }
                     if !t.approved && status == "paused" && !t.files.is_empty() {
                         t.status = "selecting".into();
                     }
@@ -493,13 +499,12 @@ impl Transfers {
             let _ = self.rpc("saveSession", json!([])).await;
             let _ = self.rpc("shutdown", json!([])).await;
         }
-        if let Some(mut child) = self.child.lock().await.take() {
-            if tokio::time::timeout(Duration::from_secs(5), child.wait())
+        if let Some(mut child) = self.child.lock().await.take()
+            && tokio::time::timeout(Duration::from_secs(5), child.wait())
                 .await
                 .is_err()
-            {
-                let _ = child.kill().await;
-            }
+        {
+            let _ = child.kill().await;
         }
     }
 }

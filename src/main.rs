@@ -9,6 +9,7 @@ mod gateway;
 mod links;
 mod review;
 mod serve_file;
+mod telemetry;
 mod thunder;
 mod transfers;
 
@@ -58,6 +59,7 @@ struct Inner {
     control: control::Control,
     transfers: transfers::Transfers,
     bandwidth: bandwidth::Bandwidth,
+    telemetry: telemetry::Telemetry,
 }
 struct Running {
     cancel: CancellationToken,
@@ -607,6 +609,7 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    let telemetry = telemetry::Telemetry::new(&data, &saved)?;
     let bandwidth = bandwidth::Bandwidth::new(&data)?;
     let transfers = transfers::Transfers::new(&data, &downloads, &token).await?;
     let app = App(Arc::new(Inner {
@@ -625,6 +628,7 @@ async fn main() -> Result<()> {
         control,
         transfers,
         bandwidth,
+        telemetry,
     }));
     app.save(&*app.0.jobs.lock().await).await?;
     let monitor = app.clone();
@@ -669,6 +673,15 @@ async fn main() -> Result<()> {
             if let Err(_error) = transfer_worker.0.transfers.poll(elapsed).await {
                 eprintln!("链接任务状态暂未同步");
             }
+            if transfer_worker
+                .0
+                .telemetry
+                .sample(&transfer_worker, elapsed)
+                .await
+                .is_err()
+            {
+                eprintln!("全局统计暂未保存");
+            }
             let native = !transfer_worker.0.running.lock().await.is_empty();
             if transfer_worker
                 .0
@@ -696,6 +709,7 @@ async fn main() -> Result<()> {
         .merge(transfers::routes())
         .merge(links::routes())
         .merge(bandwidth::routes())
+        .merge(telemetry::routes())
         .route("/status", get(status))
         .route("/browse", get(browse))
         .route("/jobs", get(jobs).post(create))

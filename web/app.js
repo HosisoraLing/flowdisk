@@ -23,7 +23,7 @@ async function initialize() {
     $('thread-setting').textContent = `每文件最多 ${status.threads} 连接`;
     if(!status.gateway_connected) toast(status.gateway_error || '请先配置 OpenList 网盘');
     await loadAccounts(); await loadSmb(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares();
-    clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
+    clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(view==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(()=>{}); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
   } catch(e) { if(!$('workspace').hidden) toast(e.message); else { loginView(); $('login-error').textContent = e.message === '请先登录' ? '' : e.message; } }
 }
 $('login-form').onsubmit = async event => {
@@ -33,12 +33,13 @@ $('login-form').onsubmit = async event => {
 $('logout').onclick = async () => { await api('/logout',{method:'POST'}); loginView(); };
 function setView(next) {
   view = next;
-  for(const name of ['browse','tasks','local','accounts','links']) { $(name+'-view').hidden = next !== name; $(name+'-tab').classList.toggle('active',next===name); }
+  for(const name of ['browse','tasks','local','accounts','links','statistics']) { $(name+'-view').hidden = next !== name; $(name+'-tab').classList.toggle('active',next===name); }
   if(next==='local') loadLocal().catch(e=>toast(e.message));
+  if(next==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(e=>toast(e.message));
   if(next==='links'&&typeof loadTools==='function')loadTools().catch(e=>toast(e.message));
   if(next==='accounts') loadAccounts().catch(e=>toast(e.message));
 }
-for(const name of ['browse','tasks','local','accounts','links']) $(name+'-tab').onclick=()=>setView(name);
+for(const name of ['browse','tasks','local','accounts','links','statistics']) $(name+'-tab').onclick=()=>setView(name);
 function join(name) { return currentPath.replace(/\/$/,'') + '/' + name; }
 async function loadRoots() { try { const result = await api('/browse?path=%2F'); roots = result.content || []; } catch { roots = []; } renderDrives(); }
 function renderDrives() {
@@ -161,7 +162,7 @@ async function loadJobs() {
         eta.textContent=`预计剩余 ${duration} · 预计完成 ${new Date(Date.now()+seconds*1000).toLocaleString()}（随速度更新）`;
       } else eta.textContent='正在估算完成时间…';
     }
-    if(job.engine==='aria2'&&['torrent','magnet'].includes(job.kind))task.append(text('p',`上传 ${bytes(job.upload_speed)}/s · 累计上传 ${bytes(job.uploaded)} · 分享率 ${job.share_ratio.toFixed(2)} · 连接 ${job.peers} / 做种 ${job.seeders} · 分片 ${job.completed_pieces}/${job.pieces}`,'bt-stats'));
+    if(job.engine==='aria2'&&['torrent','magnet'].includes(job.kind))task.append(text('p',`上传 ${bytes(job.upload_speed)}/s · 累计上传 ${bytes(job.uploaded)} · 分享率 ${job.share_ratio.toFixed(2)} · 上传峰值 ${bytes(job.peak_upload_speed)}/s · 上传均值 ${bytes(job.average_upload_speed)}/s · 连接 ${job.peers} / 做种 ${job.seeders} · 分片 ${job.completed_pieces}/${job.pieces}`,'bt-stats'));
     task.append(metrics,speedChart(job),eta);
     if(job.error) task.append(text('p',job.error,'task-error')); if(job.sha256) task.append(text('p','SHA-256 '+job.sha256,'checksum')); (destinations.get(job.group_id||('single:'+job.id))||$('tasks')).append(task);
   }
