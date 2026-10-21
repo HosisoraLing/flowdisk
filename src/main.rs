@@ -7,6 +7,7 @@ mod external;
 mod files;
 mod gateway;
 mod links;
+mod mcp;
 mod review;
 mod serve_file;
 mod telemetry;
@@ -720,6 +721,7 @@ async fn main() -> Result<()> {
         .route("/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     let router = Router::new()
+        .merge(mcp::routes())
         .nest("/api", api)
         .route("/api/session", post(session))
         .route("/oauth/baidu/callback", get(auth::baidu_callback))
