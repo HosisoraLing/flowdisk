@@ -351,7 +351,7 @@ impl Transfers {
             if is_bt && status == "active" && total == 0 {
                 t.status = "metadata".into();
             }
-            downloading |= matches!(t.status.as_str(), "downloading" | "queued" | "metadata");
+
             t.peers = number(&v, "connections");
             t.seeders = number(&v, "numSeeders");
             t.pieces = number(&v, "numPieces");
@@ -456,6 +456,7 @@ impl Transfers {
                     t.name = t.files[0].name.clone();
                 }
             }
+            downloading |= matches!(t.status.as_str(), "downloading" | "queued" | "metadata");
         }
         self.downloading.store(downloading, Ordering::Relaxed);
         self.persist(&tasks).await
@@ -627,9 +628,14 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
     }
     tasks.insert(id, task.clone());
     app.0.transfers.persist(&tasks).await?;
-    drop(tasks);
-    if let Err(error) = app.0.transfers.add(&task, uploaded).await {
-        let mut tasks = app.0.transfers.tasks.lock().await;
+    app.0.transfers.downloading.store(true, Ordering::Relaxed);
+    let native = app.0.bandwidth.native_active.load(Ordering::Relaxed);
+    let added = async {
+        app.0.bandwidth.budget(&app, native).await?;
+        app.0.transfers.add(&task, uploaded).await
+    }
+    .await;
+    if let Err(error) = added {
         if let Some(t) = tasks.get_mut(&id) {
             t.status = "failed".into();
             t.error = Some(error.to_string());
@@ -661,6 +667,9 @@ async fn resume(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<
     if !task.approved && !task.files.is_empty() {
         return Err(bad("请先选择种子文件，再开始下载"));
     }
+    app.0.transfers.downloading.store(true, Ordering::Relaxed);
+    let native = app.0.bandwidth.native_active.load(Ordering::Relaxed);
+    app.0.bandwidth.budget(&app, native).await?;
     if app
         .0
         .transfers
@@ -716,6 +725,9 @@ async fn select(
         .transfers
         .rpc("changeOption", json!([t.gid,{"select-file":selected}]))
         .await?;
+    app.0.transfers.downloading.store(true, Ordering::Relaxed);
+    let native = app.0.bandwidth.native_active.load(Ordering::Relaxed);
+    app.0.bandwidth.budget(&app, native).await?;
     t.approved = true;
     for f in &mut t.files {
         f.selected = input.indices.contains(&f.index);

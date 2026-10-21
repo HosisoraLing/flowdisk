@@ -1,5 +1,6 @@
 mod auth;
 mod baidu;
+mod bandwidth;
 mod control;
 mod download;
 mod external;
@@ -56,6 +57,7 @@ struct Inner {
     threads: usize,
     control: control::Control,
     transfers: transfers::Transfers,
+    bandwidth: bandwidth::Bandwidth,
 }
 struct Running {
     cancel: CancellationToken,
@@ -204,6 +206,23 @@ impl App {
                 sampled_bytes: 0,
             },
         );
+        self.0
+            .bandwidth
+            .native_active
+            .store(true, Ordering::Relaxed);
+        if let Err(error) = self.0.bandwidth.budget(self, true).await {
+            running.remove(&id);
+            self.0
+                .bandwidth
+                .native_active
+                .store(!running.is_empty(), Ordering::Relaxed);
+            if let Some(job) = jobs.get_mut(&id) {
+                job.status = "failed".into();
+                job.error = Some("限速协调失败，任务未启动，可稍后重试".into());
+            }
+            self.save(&jobs).await?;
+            return Err(error.into());
+        }
         let app = self.clone();
         tokio::spawn(async move {
             let result = async {
@@ -257,6 +276,16 @@ impl App {
                 eprintln!("保存任务状态失败: {err}");
             }
             running.remove(&id);
+            let native = !running.is_empty();
+            app.0
+                .bandwidth
+                .native_active
+                .store(native, Ordering::Relaxed);
+            drop(jobs);
+            drop(running);
+            if app.0.bandwidth.budget(&app, native).await.is_err() {
+                eprintln!("限速配额暂未同步");
+            }
         });
         Ok(())
     }
@@ -578,6 +607,7 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    let bandwidth = bandwidth::Bandwidth::new(&data)?;
     let transfers = transfers::Transfers::new(&data, &downloads, &token).await?;
     let app = App(Arc::new(Inner {
         gateway,
@@ -594,6 +624,7 @@ async fn main() -> Result<()> {
         threads,
         control,
         transfers,
+        bandwidth,
     }));
     app.save(&*app.0.jobs.lock().await).await?;
     let monitor = app.clone();
@@ -619,6 +650,14 @@ async fn main() -> Result<()> {
             }
         }
     });
+    app.0.bandwidth.budget(&app, false).await?;
+    {
+        let settings = app.0.bandwidth.settings.lock().await.clone();
+        app.0
+            .transfers
+            .seed_options(settings.seed_ratio, settings.seed_minutes)
+            .await?;
+    }
     let transfer_worker = app.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -629,6 +668,16 @@ async fn main() -> Result<()> {
             last = Instant::now();
             if let Err(_error) = transfer_worker.0.transfers.poll(elapsed).await {
                 eprintln!("链接任务状态暂未同步");
+            }
+            let native = !transfer_worker.0.running.lock().await.is_empty();
+            if transfer_worker
+                .0
+                .bandwidth
+                .budget(&transfer_worker, native)
+                .await
+                .is_err()
+            {
+                eprintln!("限速配额暂未同步");
             }
         }
     });
@@ -646,6 +695,7 @@ async fn main() -> Result<()> {
         .merge(review::routes())
         .merge(transfers::routes())
         .merge(links::routes())
+        .merge(bandwidth::routes())
         .route("/status", get(status))
         .route("/browse", get(browse))
         .route("/jobs", get(jobs).post(create))

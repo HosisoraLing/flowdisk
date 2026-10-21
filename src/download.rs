@@ -360,10 +360,12 @@ async fn part(
                     let next = tokio::select! { _ = cancel.cancelled() => bail!("已暂停"), n = stream.try_next() => n.map_err(|e|e.without_url())? };
                     let Some(bytes) = next else { break; };
                     ensure!(written + bytes.len() as u64 <= current + wanted, "分段超出预期长度");
-                    file.write_all(&bytes).await?;
-                    written += bytes.len() as u64;
-                    progress.bytes.fetch_add(bytes.len() as u64,Ordering::Relaxed);
-                    progress.transferred.fetch_add(bytes.len() as u64,Ordering::Relaxed);
+                    for part in bytes.chunks(16*1024){
+                        app.0.bandwidth.wait(part.len(),cancel).await?;
+                        file.write_all(part).await?;written+=part.len() as u64;
+                        progress.bytes.fetch_add(part.len() as u64,Ordering::Relaxed);
+                        progress.transferred.fetch_add(part.len() as u64,Ordering::Relaxed);
+                    }
                 }
                 Ok(())
             }.await;
@@ -431,13 +433,22 @@ async fn sequential(
         let Some(bytes) = next else {
             break;
         };
-        written += bytes.len() as u64;
-        ensure!(written <= size, "单连接内容超出预期长度");
-        output.write_all(&bytes).await?;
-        progress.bytes.store(written, Ordering::Relaxed);
-        progress
-            .transferred
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        ensure!(
+            written + bytes.len() as u64 <= size,
+            "单连接内容超出预期长度"
+        );
+        for part in bytes.chunks(16 * 1024) {
+            if let Err(error) = app.0.bandwidth.wait(part.len(), cancel).await {
+                output.flush().await?;
+                return Err(error);
+            }
+            output.write_all(part).await?;
+            written += part.len() as u64;
+            progress.bytes.store(written, Ordering::Relaxed);
+            progress
+                .transferred
+                .fetch_add(part.len() as u64, Ordering::Relaxed);
+        }
     }
     output.flush().await?;
     output.get_ref().sync_data().await?;
