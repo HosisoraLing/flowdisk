@@ -22,7 +22,7 @@ async function initialize() {
     $('connection').textContent = status.gateway_connected ? '网盘网关已连接' : '网盘网关待配置';
     $('thread-setting').textContent = `每文件最多 ${status.threads} 连接`;
     if(!status.gateway_connected) toast(status.gateway_error || '请先配置 OpenList 网盘');
-    await loadAccounts(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares();
+    await loadAccounts(); await loadSmb(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares();
     clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
   } catch(e) { if(!$('workspace').hidden) toast(e.message); else { loginView(); $('login-error').textContent = e.message === '请先登录' ? '' : e.message; } }
 }
@@ -308,3 +308,11 @@ window.addEventListener('message',async event=>{
   const token=value.captcha_token||value.captchaToken;if(typeof token!=='string'||token.length<16||token.length>4096)return;
   try{await finishAction({action:'challenge',captcha_token:token});}catch(e){$('account-message').textContent=e.message;}
 });
+
+async function loadSmb(){
+  const rows=await api('/connections');$('smb-connections').replaceChildren();
+  for(const row of rows){const card=text('div','','smb-card');card.append(button('▰ '+row.name,()=>{setView('browse');browse(row.mount_path,1);}),text('small',row.status==='connected'?row.address+' / '+row.share:'连接不可用'),button('断开',async()=>{if(!confirm('断开 SMB 连接？远端文件不会删除。'))return;try{await api('/connections/'+row.id,{method:'DELETE'});await loadSmb();await loadRoots();if(currentPath===row.mount_path||currentPath.startsWith(row.mount_path+'/'))await browse('/',1);}catch(e){toast(e.message);}}));$('smb-connections').append(card);}
+  if(!rows.length)$('smb-connections').append(text('small','连接 NAS 或局域网服务器，直接浏览和下载共享文件。'));
+}
+$('add-smb').onclick=()=>{$('smb-error').textContent='';$('smb-dialog').showModal();};$('close-smb').onclick=()=>$('smb-dialog').close();
+$('smb-form').onsubmit=async event=>{event.preventDefault();const submit=$('smb-form').querySelector('[type=submit]');submit.disabled=true;try{const body=Object.fromEntries(new FormData($('smb-form')));body.port=Number(body.port);const result=await api('/connections/smb',{method:'POST',body:JSON.stringify(body)});$('smb-password').value='';$('smb-dialog').close();await loadSmb();await loadRoots();await browse(result.mount_path,1,true);}catch(e){$('smb-error').textContent=e.message;}finally{submit.disabled=false;}};

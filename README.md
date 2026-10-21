@@ -228,3 +228,7 @@ GitHub 开源实现与速度实测边界见 [百度下载调研](docs/baidu-rese
 - `GET/HEAD /api/shares/{id}/preview?path=...`：仅允许此分享的已准备文件；`GET/HEAD /api/preview?path=...` 用于已存网盘文件预览。接口经过工作台认证，不向浏览器暴露网盘下载凭据。
 
 桌面示例：[分享内容](docs/share-desktop.png)、[转存容量](docs/share-capacity.png)、[分组任务](docs/download-groups.png)。示例均使用虚构文件。
+
+## SMB 网络共享
+
+在“网盘文件 → 连接 SMB”填写连接名、服务器 IP/域名、端口（默认 445）、共享名称和用户名/密码，可指定共享内根目录。连接会先验证，失败时保留原配置；支持多个共享。密码仅提交至后端并由 OpenList 保存，不返回浏览器。文件浏览、预览、上传、改名、移动、删除和下载沿用网盘流程，操作能力受共享权限限制。更换或断开有活动下载的连接前先暂停任务。

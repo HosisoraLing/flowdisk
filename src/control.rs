@@ -1079,8 +1079,89 @@ pub fn remote_name(name: &str) -> bool {
         && name.len() <= 1024
         && !name.contains(['\0', '/', '\\'])
 }
+#[derive(Deserialize)]
+struct SmbInput {
+    name: String,
+    host: String,
+    #[serde(default = "smb_port")]
+    port: u16,
+    share: String,
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    root: String,
+}
+fn smb_port() -> u16 {
+    445
+}
+async fn connections(State(app): State<App>) -> ApiResult<Json<Value>> {
+    let rows=storages(&app).await?.into_iter().filter(|s|s["driver"]=="SMB").map(|s|{
+        let addition:Value=serde_json::from_str(s["addition"].as_str().unwrap_or("{}")).unwrap_or(Value::Null);
+        json!({"id":s["id"],"name":s["mount_path"].as_str().unwrap_or("").trim_start_matches('/'),"mount_path":s["mount_path"],"status":if s["disabled"]==true{"disabled"}else if s["status"]=="work"{"connected"}else{"unavailable"},"address":addition["address"],"share":addition["share_name"]})
+    }).collect::<Vec<_>>();
+    Ok(Json(json!(rows)))
+}
+async fn connect_smb(
+    State(app): State<App>,
+    Json(input): Json<SmbInput>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&input.name)
+        || input.name.len() > 80
+        || input.host.len() > 253
+        || input.port == 0
+        || !valid_name(&input.share)
+        || input.username.is_empty()
+        || input.username.len() > 256
+        || input.password.len() > 4096
+        || input.root.len() > 1024
+        || input.root.contains(['\\', '\0'])
+        || input.root.split('/').any(|p| p == "..")
+    {
+        return Err(bad("SMB 名称、地址、共享名或凭据格式无效"));
+    }
+    let host = reqwest::Url::parse(&format!("smb://{}:{}", input.host, input.port))
+        .map_err(|_| bad("SMB 服务器地址无效，请填写 IP 或主机名"))?;
+    if host.username() != ""
+        || host.password().is_some()
+        || !matches!(host.path(), "" | "/")
+        || host.query().is_some()
+        || host.fragment().is_some()
+        || host.host().is_none()
+    {
+        return Err(bad("SMB 地址不能包含凭据、路径或查询参数"));
+    }
+    let mount = format!("/SMB-{}", input.name);
+    let _lock = app.0.control.account_lock.lock().await;
+    let credential = json!({"driver":"SMB","addition":{"address":format!("{}:{}",host.host().unwrap(),input.port),"share_name":input.share,"username":input.username,"password":input.password,"root_folder_path":if input.root.is_empty(){"."}else{&input.root}}});
+    upsert_storage(&app, "smb", &credential, Some(&mount)).await?;
+    Ok(Json(json!({"ok":true,"mount_path":mount})))
+}
+async fn disconnect_smb(State(app): State<App>, Path(id): Path<u64>) -> ApiResult<Json<Value>> {
+    let _lock = app.0.control.account_lock.lock().await;
+    let storage = storages(&app)
+        .await?
+        .into_iter()
+        .find(|s| s["id"].as_u64() == Some(id) && s["driver"] == "SMB")
+        .ok_or_else(|| bad("SMB 连接不存在"))?;
+    let mount = storage["mount_path"].as_str().unwrap_or("");
+    if app.0.jobs.lock().await.values().any(|j| {
+        j.path.starts_with(&format!("{mount}/"))
+            && matches!(j.status.as_str(), "queued" | "downloading" | "pausing")
+    }) {
+        return Err(bad("请先暂停这个 SMB 连接的下载任务"));
+    }
+    app.0
+        .gateway
+        .post(&format!("/api/admin/storage/delete?id={id}"), json!({}))
+        .await?;
+    Ok(Json(json!({"ok":true})))
+}
 pub fn routes() -> Router<App> {
     Router::new()
+        .route("/connections", get(connections))
+        .route("/connections/smb", post(connect_smb))
+        .route("/connections/{id}", axum::routing::delete(disconnect_smb))
         .route("/accounts", get(accounts))
         .route("/accounts/{key}/login", post(login))
         .route("/accounts/{key}", axum::routing::delete(disconnect))
