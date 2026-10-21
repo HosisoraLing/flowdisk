@@ -8,6 +8,7 @@ mod gateway;
 mod review;
 mod serve_file;
 mod thunder;
+mod transfers;
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
@@ -53,6 +54,7 @@ struct Inner {
     secure_cookie: bool,
     threads: usize,
     control: control::Control,
+    transfers: transfers::Transfers,
 }
 struct Running {
     cancel: CancellationToken,
@@ -575,6 +577,7 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    let transfers = transfers::Transfers::new(&data, &downloads, &token).await?;
     let app = App(Arc::new(Inner {
         gateway,
         client,
@@ -589,6 +592,7 @@ async fn main() -> Result<()> {
         secure_cookie: env::var("COOKIE_SECURE").is_ok_and(|v| v == "true"),
         threads,
         control,
+        transfers,
     }));
     app.save(&*app.0.jobs.lock().await).await?;
     let monitor = app.clone();
@@ -614,6 +618,19 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let transfer_worker = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut last = Instant::now();
+        loop {
+            tick.tick().await;
+            let elapsed = last.elapsed().as_millis() as u64;
+            last = Instant::now();
+            if let Err(_error) = transfer_worker.0.transfers.poll(elapsed).await {
+                eprintln!("链接任务状态暂未同步");
+            }
+        }
+    });
     let share_worker = app.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -626,6 +643,7 @@ async fn main() -> Result<()> {
         .merge(control::routes())
         .merge(files::routes())
         .merge(review::routes())
+        .merge(transfers::routes())
         .route("/status", get(status))
         .route("/browse", get(browse))
         .route("/jobs", get(jobs).post(create))
@@ -664,6 +682,15 @@ async fn main() -> Result<()> {
             }),
         )
         .route(
+            "/tools.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/tools.js"),
+                )
+            }),
+        )
+        .route(
             "/style.css",
             get(|| async {
                 (
@@ -689,6 +716,7 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(unix))]
             let _ = tokio::signal::ctrl_c().await;
+            app.0.transfers.shutdown().await;
             for running in app.0.running.lock().await.values() {
                 running.cancel.cancel();
             }

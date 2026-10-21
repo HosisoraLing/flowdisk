@@ -8,7 +8,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked && cp target/release/flowdisk /build/flowdisk
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl aria2=1.36.0-1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10001 flowdisk && useradd -r -u 10001 -g flowdisk flowdisk \
     && mkdir /data /downloads && chown flowdisk:flowdisk /data /downloads

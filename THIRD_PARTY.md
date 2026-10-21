@@ -38,7 +38,7 @@ Rust 下载实现为本项目原创，依赖以下项目；具体版本及传递
 - [uuid](https://github.com/uuid-rs/uuid)：任务 ID；固定 1.18.1 以兼容 Rust 1.88 构建镜像。
 - [RustCrypto SHA-2](https://github.com/RustCrypto/hashes)：流式 SHA-256。
 
-没有内嵌 aria2、rclone、付费解析服务或第三方账号凭据。发布二进制或镜像时，应随其附上适用的依赖许可证；通过网络提供被修改的 OpenList 时，还须遵守该项目 AGPL 的源代码提供义务。此处仅记录组件边界，不改变各项目许可证。
+没有内嵌 rclone、付费解析服务或第三方账号凭据。v0.6 起，Docker 通过 Debian 软件包安装独立 aria2 进程处理普通链接与 BT，不链接到 Rust 二进制。发布二进制或镜像时，应随其附上适用的依赖许可证；通过网络提供被修改的 OpenList 时，还须遵守该项目 AGPL 的源代码提供义务。此处仅记录组件边界，不改变各项目许可证。
 
 ## v0.2 认证接口参考
 
@@ -96,3 +96,7 @@ Rust 的分享只读视图与授权回调按官方协议独立实现：
 - [Google Drive resource keys](https://developers.google.com/workspace/drive/api/guides/resource-keys)：资源访问键仅通过后端请求传递。
 
 微软和 Google 的真实账号、管理员授权和实际限流行为没有通过模拟接口验证，不将协议模拟结果表述为真实账号登录完成。
+
+## 聚合下载引擎
+
+[aria2](https://github.com/aria2/aria2)，Docker 使用 Debian bookworm 的 `aria2=1.36.0-1` 软件包。aria2 按 GPL-2.0-or-later 独立分发，许可证与源码包见 [Debian 包页面](https://packages.debian.org/bookworm/aria2) 和镜像中的 `/usr/share/doc/aria2/copyright`。Rust 程序经本机 JSON-RPC 控制独立进程，不复制或链接其代码。公开源码包仅包含 FlowDisk 原创代码、构建文件与说明；重新分发镜像及 aria2 软件包时仍须遵守上游许可。
