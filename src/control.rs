@@ -240,6 +240,34 @@ async fn upsert_storage(
     for (key, value) in supplied {
         addition[key] = value.clone();
     }
+    if driver == "Onedrive" && addition["flowdisk_public_client"] == true {
+        let client = addition["client_id"]
+            .as_str()
+            .ok_or_else(|| bad("缺少微软客户端 ID"))?;
+        let mut endpoint = Url::parse(
+            &std::env::var("FLOWDISK_INTERNAL_URL")
+                .unwrap_or_else(|_| "http://downloader:8080".into()),
+        )
+        .map_err(|_| bad("下载器内部地址无效"))?;
+        if !matches!(endpoint.scheme(), "http" | "https")
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            return Err(bad("下载器内部地址无效"));
+        }
+        endpoint.set_path("/internal/onedrive/renew");
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        endpoint
+            .query_pairs_mut()
+            .append_pair("client_id", client)
+            .append_pair(
+                "key",
+                &crate::auth::microsoft_bridge_key(&app.0.token, client),
+            );
+        addition["api_url_address"] = endpoint.to_string().into();
+        addition["use_online_api"] = true.into();
+    }
     let existing = storages(app)
         .await?
         .into_iter()
@@ -319,7 +347,7 @@ async fn login(
     Json(body): Json<LoginStart>,
 ) -> ApiResult<Json<Value>> {
     provider(&key)?;
-    if !["sms", "qr", "oauth", "cookie", "credential"].contains(&body.mode.as_str()) {
+    if !["sms", "qr", "oauth", "device", "cookie", "credential"].contains(&body.mode.as_str()) {
         return Err(bad("登录方式不合法"));
     }
     let v = app

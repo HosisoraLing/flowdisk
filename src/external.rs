@@ -58,6 +58,26 @@ pub(crate) struct OAuthConfig {
     pub public_url: String,
 }
 impl OAuthConfig {
+    pub fn validate(&self, provider: &str) -> Result<()> {
+        ensure!(
+            ["google", "onedrive"].contains(&provider)
+                && !self.client_id.trim().is_empty()
+                && self.client_id.len() <= 2000
+                && !self.client_id.contains(['\r', '\n']),
+            "请填写有效的应用客户端 ID"
+        );
+        if !self.public_url.is_empty() {
+            self.resolve(provider)?;
+        } else if provider == "google" {
+            ensure!(
+                !self.client_secret.is_empty()
+                    && self.client_secret.len() <= 2000
+                    && !self.client_secret.contains(['\r', '\n']),
+                "请填写 Google 桌面应用客户端密钥"
+            );
+        }
+        Ok(())
+    }
     pub fn resolve(&self, provider: &str) -> Result<(String, String, String)> {
         ensure!(["onedrive", "google"].contains(&provider), "不支持的网盘");
         let base = Url::parse(&self.public_url)?;
@@ -315,7 +335,14 @@ impl External {
         {
             return Ok(t.value.clone());
         }
-        let response = if addition["use_online_api"] == true {
+        // OpenList serializes its typed addition and drops unknown fields on refresh.
+        let public_client = provider == "onedrive"
+            && (addition["flowdisk_public_client"] == true
+                || addition["api_url_address"]
+                    .as_str()
+                    .and_then(|v| Url::parse(v).ok())
+                    .is_some_and(|u| u.path() == "/internal/onedrive/renew"));
+        let response = if addition["use_online_api"] == true && !public_client {
             let endpoint = if provider == "google" {
                 "https://api.oplist.org/googleui/renewapi"
             } else {
@@ -338,21 +365,19 @@ impl External {
                 .send()
                 .await
         } else {
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", addition["client_id"].as_str().unwrap_or("")),
+            ];
+            for key in ["client_secret", "redirect_uri"] {
+                if let Some(value) = addition[key].as_str().filter(|v| !v.is_empty()) {
+                    form.push((key, value));
+                }
+            }
             self.client
                 .post(self.request_url(Url::parse(token_endpoint(provider))?))
-                .form(&[
-                    ("grant_type", "refresh_token"),
-                    ("refresh_token", refresh),
-                    ("client_id", addition["client_id"].as_str().unwrap_or("")),
-                    (
-                        "client_secret",
-                        addition["client_secret"].as_str().unwrap_or(""),
-                    ),
-                    (
-                        "redirect_uri",
-                        addition["redirect_uri"].as_str().unwrap_or(""),
-                    ),
-                ])
+                .form(&form)
                 .send()
                 .await
         }
@@ -763,6 +788,21 @@ mod tests {
             }
             panic!("Unexpected gateway mutation: {path}");
         }
+        if path.ends_with("token") {
+            let raw = to_bytes(req.into_body(), 65536).await.unwrap();
+            let form: BTreeMap<_, _> =
+                Url::parse(&format!("http://local/?{}", String::from_utf8_lossy(&raw)))
+                    .unwrap()
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+            assert_eq!(form["client_id"], "device-test-client");
+            assert!(!form.contains_key("client_secret") && !form.contains_key("redirect_uri"));
+            state.refreshes += 1;
+            return Json(
+                json!({"access_token":"private-access","refresh_token":"private-rotated","expires_in":3600}),
+            );
+        }
         if path.ends_with("renewapi") {
             state.refreshes += 1;
             return Json(
@@ -810,7 +850,14 @@ mod tests {
         fs::create_dir(&data).await.unwrap();
         let mut storages = Vec::new();
         for (id, provider) in [(1, "google"), (2, "onedrive")] {
-            let c = credential(provider, "private-refresh", &json!({})).unwrap();
+            let mut c = credential(provider, "private-refresh", &json!({})).unwrap();
+            if provider == "onedrive" {
+                c["addition"]["api_url_address"] =
+                    "http://downloader:8080/internal/onedrive/renew?key=fixture".into();
+                c["addition"]["client_id"] = "device-test-client".into();
+                c["addition"]["client_secret"] = "".into();
+                c["addition"]["redirect_uri"] = "".into();
+            }
             storages.push(json!({"id":id,"driver":c["driver"],"addition":serde_json::to_string(&c["addition"]).unwrap(),"status":"work","disabled":false,"mount_path":format!("/{provider}")}));
         }
         let state = Arc::new(Mutex::new(Fixture {

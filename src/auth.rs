@@ -20,6 +20,7 @@ const DRIVE: &str = "https://drive-pc.quark.cn/1/clouddrive";
 pub struct Auth {
     client: reqwest::Client,
     thunder_base: Url,
+    microsoft_base: Url,
     sms_sent: Mutex<BTreeMap<String, u64>>,
     sessions: Mutex<BTreeMap<Uuid, Session>>,
     credentials: Mutex<BTreeMap<String, Value>>,
@@ -58,7 +59,8 @@ impl Session {
 pub fn methods(key: &str) -> Vec<&'static str> {
     match key {
         "quark" => vec!["sms", "qr", "credential"],
-        "onedrive" | "google" => vec!["oauth", "credential"],
+        "onedrive" => vec!["device", "oauth", "credential"],
+        "google" => vec!["oauth", "credential"],
         "115" => vec!["qr", "credential"],
         "thunder" => vec!["sms", "qr", "credential"],
         "baidu" if oauth_config().is_ok() => vec!["qr", "cookie", "oauth", "credential"],
@@ -169,6 +171,7 @@ impl Auth {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             thunder_base: Url::parse("https://xluser-ssl.xunlei.com/")?,
+            microsoft_base: Url::parse("https://login.microsoftonline.com/common/oauth2/v2.0/")?,
             sms_sent: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             credentials: Mutex::new(BTreeMap::new()),
@@ -190,11 +193,27 @@ impl Auth {
         Ok(auth)
     }
     async fn external_oauth_config(&self, provider: &str) -> Result<(String, String, String)> {
-        if let Some(config) = self.oauth_clients.lock().await.get(provider) {
-            config.resolve(provider)
-        } else {
-            crate::external::oauth_config(provider)
-        }
+        self.external_client(provider).await.resolve(provider)
+    }
+    async fn external_client(&self, provider: &str) -> crate::external::OAuthConfig {
+        self.oauth_clients
+            .lock()
+            .await
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| {
+                let prefix = if provider == "google" {
+                    "GOOGLE"
+                } else {
+                    "ONEDRIVE"
+                };
+                crate::external::OAuthConfig {
+                    client_id: std::env::var(format!("{prefix}_CLIENT_ID")).unwrap_or_default(),
+                    client_secret: std::env::var(format!("{prefix}_CLIENT_SECRET"))
+                        .unwrap_or_default(),
+                    public_url: std::env::var("PUBLIC_URL").unwrap_or_default(),
+                }
+            })
     }
     async fn http(
         &self,
@@ -316,6 +335,59 @@ impl Auth {
             cookies: BTreeMap::new(),
         };
         match (key, mode) {
+            ("onedrive", "device") => {
+                let config = self.external_client(key).await;
+                if config.client_id.trim().is_empty() {
+                    s.public["setup_required"] = true.into();
+                    s.message = "配置一次微软应用客户端 ID，并在微软应用后台启用公共客户端流；无需密钥、域名或回调地址".into();
+                } else {
+                    let response = self
+                        .client
+                        .post(self.microsoft_base.join("devicecode").unwrap())
+                        .form(&[
+                            ("client_id", config.client_id.as_str()),
+                            ("scope", "offline_access Files.ReadWrite.All"),
+                        ])
+                        .send()
+                        .await
+                        .map_err(|_| bad("无法连接微软登录服务，请检查网络"))?;
+                    let success = response.status().is_success();
+                    let value: Value =
+                        response.json().await.map_err(|_| bad("微软登录响应无效"))?;
+                    if !success {
+                        return Err(bad(
+                            "无法申请微软设备码，请检查客户端 ID、支持的账号类型及公共客户端流设置",
+                        ));
+                    }
+                    let uri = Url::parse(value["verification_uri"].as_str().unwrap_or(""))
+                        .map_err(|_| bad("微软未返回官方登录地址"))?;
+                    if uri.scheme() != "https"
+                        || !matches!(
+                            uri.host_str(),
+                            Some(
+                                "microsoft.com" | "www.microsoft.com" | "login.microsoftonline.com"
+                            )
+                        )
+                        || !uri.username().is_empty()
+                        || uri.password().is_some()
+                    {
+                        return Err(bad("微软返回了无效登录地址"));
+                    }
+                    let code = value["user_code"]
+                        .as_str()
+                        .filter(|v| !v.is_empty() && v.len() <= 40)
+                        .ok_or_else(|| bad("微软未返回设备码"))?;
+                    let ticket = value["device_code"]
+                        .as_str()
+                        .filter(|v| !v.is_empty() && v.len() <= 12000)
+                        .ok_or_else(|| bad("微软未返回设备凭据"))?;
+                    s.public["verification_uri"] = uri.to_string().into();
+                    s.public["user_code"] = code.into();
+                    s.private = json!({"device_code":ticket,"client_id":config.client_id,"interval":value["interval"].as_u64().unwrap_or(5).clamp(2,60)});
+                    s.expires = now() + value["expires_in"].as_u64().unwrap_or(900).clamp(30, 1800);
+                    s.message = "打开微软官方登录页，输入设备码并授权；工作台会自动连接，无需公网 IP 或回调地址".into();
+                }
+            }
             ("quark", "sms") => {
                 s.public["form_url"] = json!(
                     "https://uop.quark.cn/cas/custom/login?custom_login_type=mobile&client_id=532&display=pc&origin=*"
@@ -695,6 +767,64 @@ impl Auth {
         Ok(())
     }
     async fn poll(&self, s: &mut Session) -> ApiResult<()> {
+        if s.provider == "onedrive" && s.mode == "device" {
+            if s.status != "waiting"
+                || s.public["setup_required"] == true
+                || now() < s.last_poll + s.private["interval"].as_u64().unwrap_or(5)
+            {
+                return Ok(());
+            }
+            s.last_poll = now();
+            let response = self
+                .client
+                .post(self.microsoft_base.join("token").unwrap())
+                .form(&[
+                    ("client_id", s.private["client_id"].as_str().unwrap_or("")),
+                    (
+                        "device_code",
+                        s.private["device_code"].as_str().unwrap_or(""),
+                    ),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ])
+                .send()
+                .await
+                .map_err(|_| bad("微软登录查询失败，请检查网络后重试"))?;
+            let success = response.status().is_success();
+            let value: Value = response.json().await.map_err(|_| bad("微软登录响应无效"))?;
+            match value["error"].as_str().unwrap_or("") {
+                "authorization_pending" => {}
+                "slow_down" => {
+                    s.private["interval"] = (s.private["interval"].as_u64().unwrap_or(5) + 5)
+                        .min(120)
+                        .into()
+                }
+                "authorization_declined" | "access_denied" => {
+                    s.status = "cancelled".into();
+                    s.message = "已取消微软授权".into();
+                }
+                "expired_token" | "bad_verification_code" => {
+                    s.status = "expired".into();
+                    s.message = "设备码已过期，请重新登录".into();
+                }
+                "" if success => {
+                    let refresh = value["refresh_token"]
+                        .as_str()
+                        .filter(|v| v.len() >= 8)
+                        .ok_or_else(|| bad("微软未授予离线访问，请重新登录"))?;
+                    s.credential = Some(
+                        json!({"driver":"Onedrive","addition":{"root_folder_path":"/","region":"global","refresh_token":refresh,"client_id":s.private["client_id"],"flowdisk_public_client":true,"use_online_api":false,"client_secret":"","redirect_uri":""}}),
+                    );
+                    s.status = "ready".into();
+                    s.message = "微软授权成功，正在连接网盘".into();
+                    s.private.as_object_mut().unwrap().remove("device_code");
+                }
+                _ => {
+                    s.status = "failed".into();
+                    s.message = "微软拒绝了设备授权，请检查应用设置或组织登录策略后重试".into();
+                }
+            }
+            return Ok(());
+        }
         if s.mode != "qr" || s.status == "ready" || now() < s.last_poll + 2 {
             return Ok(());
         }
@@ -1232,6 +1362,59 @@ pub async fn baidu_callback(State(app): State<App>, Query(q): Query<Callback>) -
     }
     match complete(&app,q).await {Ok(())=>Html("<!doctype html><meta charset=utf-8><title>授权完成</title><p>百度授权已完成，可以关闭此页并返回工作台。</p><a href=/ >返回工作台</a>").into_response(),Err(e)=>e.into_response()}
 }
+pub(crate) fn microsoft_bridge_key(token: &str, client: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(format!("flowdisk-ms-refresh:{token}:{client}"))
+    )
+}
+#[derive(Deserialize)]
+pub struct MicrosoftRefresh {
+    key: String,
+    client_id: String,
+    refresh_ui: String,
+}
+pub async fn microsoft_refresh(
+    State(app): State<App>,
+    Query(q): Query<MicrosoftRefresh>,
+) -> ApiResult<axum::Json<Value>> {
+    if q.key != microsoft_bridge_key(&app.0.token, &q.client_id)
+        || q.client_id.is_empty()
+        || q.client_id.len() > 2000
+        || !(8..=12000).contains(&q.refresh_ui.len())
+    {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "无效的内部授权请求".into(),
+        ));
+    }
+    let auth = app.0.control.native_auth();
+    let response = auth
+        .client
+        .post(auth.microsoft_base.join("token").unwrap())
+        .form(&[
+            ("client_id", q.client_id.as_str()),
+            ("refresh_token", q.refresh_ui.as_str()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|_| bad("微软授权刷新暂时失败"))?;
+    let success = response.status().is_success();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| bad("微软授权刷新响应无效"))?;
+    let access = value["access_token"]
+        .as_str()
+        .filter(|_| success)
+        .ok_or_else(|| bad("微软授权已失效，请重新登录"))?;
+    let refresh = value["refresh_token"].as_str().unwrap_or(&q.refresh_ui);
+    Ok(axum::Json(
+        json!({"access_token":access,"refresh_token":refresh}),
+    ))
+}
 pub async fn oauth_settings(
     State(app): State<App>,
     Path(provider): Path<String>,
@@ -1239,21 +1422,9 @@ pub async fn oauth_settings(
     if !["google", "onedrive"].contains(&provider.as_str()) {
         return Err(bad("不支持的网盘"));
     }
-    let configs = app.0.control.native_auth().oauth_clients.lock().await;
-    let config = configs.get(&provider).cloned().unwrap_or_else(|| {
-        let prefix = if provider == "google" {
-            "GOOGLE"
-        } else {
-            "ONEDRIVE"
-        };
-        crate::external::OAuthConfig {
-            client_id: std::env::var(format!("{prefix}_CLIENT_ID")).unwrap_or_default(),
-            client_secret: std::env::var(format!("{prefix}_CLIENT_SECRET")).unwrap_or_default(),
-            public_url: std::env::var("PUBLIC_URL").unwrap_or_default(),
-        }
-    });
+    let config = app.0.control.native_auth().external_client(&provider).await;
     Ok(axum::Json(
-        json!({"client_id":config.client_id,"public_url":config.public_url,"has_secret":!config.client_secret.is_empty(),"configured":config.resolve(&provider).is_ok()}),
+        json!({"client_id":config.client_id,"public_url":config.public_url,"has_secret":!config.client_secret.is_empty(),"configured":config.validate(&provider).is_ok()}),
     ))
 }
 pub async fn save_oauth_settings(
@@ -1278,7 +1449,17 @@ pub async fn save_oauth_settings(
             config.client_secret = secret;
         }
     }
-    let (_, _, callback) = config.resolve(&provider).map_err(|e| bad(&e.to_string()))?;
+    config
+        .validate(&provider)
+        .map_err(|e| bad(&e.to_string()))?;
+    let callback = if config.public_url.is_empty() {
+        String::new()
+    } else {
+        config
+            .resolve(&provider)
+            .map_err(|e| bad(&e.to_string()))?
+            .2
+    };
     let mut next = configs.clone();
     next.insert(provider, config);
     let path = app.0.data.join("oauth-clients.json");
@@ -1656,6 +1837,91 @@ mod thunder_tests {
             .await
             .is_err()
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn microsoft_device_flow_without_secret_or_callback() {
+        use axum::{Form, Json, Router, routing::post};
+        use std::{
+            future::IntoFuture,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        async fn device(Form(form): Form<BTreeMap<String, String>>) -> Json<Value> {
+            assert_eq!(form["client_id"], "device-test-client");
+            assert!(!form.contains_key("client_secret") && !form.contains_key("redirect_uri"));
+            assert!(form["scope"].contains("offline_access"));
+            Json(
+                json!({"device_code":"private-device-ticket","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin","interval":5,"expires_in":900}),
+            )
+        }
+        async fn token(
+            State(count): State<Arc<AtomicUsize>>,
+            Form(form): Form<BTreeMap<String, String>>,
+        ) -> Json<Value> {
+            assert!(!form.contains_key("client_secret") && !form.contains_key("redirect_uri"));
+            assert_eq!(
+                form["grant_type"],
+                "urn:ietf:params:oauth:grant-type:device_code"
+            );
+            assert_eq!(form["device_code"], "private-device-ticket");
+            Json(match count.fetch_add(1, Ordering::Relaxed) {
+                0 => json!({"error":"authorization_pending"}),
+                1 => json!({"error":"slow_down"}),
+                _ => {
+                    json!({"refresh_token":"private-ms-refresh","access_token":"private-ms-access"})
+                }
+            })
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/devicecode", post(device))
+                    .route("/token", post(token))
+                    .with_state(count.clone()),
+            )
+            .into_future(),
+        );
+        let mut auth = Auth::new().unwrap();
+        auth.microsoft_base = Url::parse(&format!("http://{address}/")).unwrap();
+        auth.oauth_clients.lock().await.insert(
+            "onedrive".into(),
+            crate::external::OAuthConfig {
+                client_id: "device-test-client".into(),
+                ..Default::default()
+            },
+        );
+        let start = auth
+            .start(&json!({"provider":"onedrive","mode":"device"}))
+            .await
+            .unwrap();
+        assert_eq!(start["user_code"], "ABCD-EFGH");
+        assert!(start.get("device_code").is_none());
+        let id = Uuid::parse_str(start["id"].as_str().unwrap()).unwrap();
+        for n in 0..3 {
+            {
+                auth.sessions.lock().await.get_mut(&id).unwrap().last_poll = 0;
+            }
+            let view = auth
+                .request(&format!("/sessions/{id}"), Method::GET, json!({}))
+                .await
+                .unwrap();
+            assert!(!view.to_string().contains("private-"));
+            assert_eq!(view["status"], if n == 2 { "ready" } else { "waiting" });
+        }
+        let sessions = auth.sessions.lock().await;
+        let session = sessions.get(&id).unwrap();
+        assert_eq!(session.private["interval"], 10);
+        let credential = session.credential.as_ref().unwrap();
+        assert_eq!(credential["addition"]["flowdisk_public_client"], true);
+        assert_eq!(credential["addition"]["client_secret"], "");
+        assert_eq!(credential["addition"]["redirect_uri"], "");
         server.abort();
     }
 }

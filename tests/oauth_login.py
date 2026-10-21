@@ -54,6 +54,14 @@ def main():
                     else:
                         raise AssertionError('invalid or cancelled authorization accepted')
                 assert app.api('/logins/' + session['id'])['status'] == 'cancelled'
+            app.api('/accounts/onedrive/oauth-config', {'client_id':'public-device-app','client_secret':'','public_url':''}, method='PUT')
+            assert app.api('/accounts/onedrive/oauth-config')['configured']
+            try:
+                urllib.request.urlopen(app.base + '/internal/onedrive/renew?key=wrong&client_id=public-device-app&refresh_ui=fixture-refresh')
+            except urllib.error.HTTPError as error:
+                assert error.code == 401
+            else:
+                raise AssertionError('internal token refresh accepted without its private key')
             config_file = root / 'data' / 'oauth-clients.json'
             assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
             assert len(json.loads(config_file.read_text())) == 2
@@ -61,7 +69,10 @@ def main():
             app.start()
             for provider in ['google', 'onedrive']:
                 assert app.api('/accounts/' + provider + '/oauth-config')['configured']
-                assert 'authorize_url' in app.api('/accounts/' + provider + '/login', {'mode': 'oauth'})
+                if provider == 'google':
+                    assert 'authorize_url' in app.api('/accounts/' + provider + '/login', {'mode': 'oauth'})
+                else:
+                    assert app.api('/accounts/onedrive/oauth-config')['public_url'] == ''
             print('PASS direct official URLs, PKCE/state, local setup, secret redaction, permissions and restart persistence')
         finally:
             app.stop()

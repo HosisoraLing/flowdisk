@@ -179,7 +179,7 @@ async function loadAccounts() {
   }
 }
 $('refresh-accounts').onclick=()=>loadAccounts().catch(e=>toast(e.message));
-const methodNames={sms:'手机验证码',qr:'扫码登录',oauth:'官方授权',cookie:'导入 Cookie',credential:'已有授权'};
+const methodNames={sms:'手机验证码',qr:'扫码登录',device:'设备码登录',oauth:'网页授权（高级）',cookie:'导入 Cookie',credential:'已有授权'};
 async function openAccount(key,mode) {
   const account=accounts.find(a=>a.id===key);if(!account)return;
   await endLogin();const revision=++loginRevision;$('account-title').textContent='连接'+account.name;$('account-content').replaceChildren();$('account-message').textContent='正在准备登录…';$('account-expiry').textContent='';$('restart-login').hidden=true;
@@ -227,6 +227,10 @@ function renderLogin(s) {
     const qr=document.createElement('img');qr.className='login-qr';qr.alt='使用'+accounts.find(a=>a.id===s.provider)?.name+' App 扫码登录';qr.src=s.qr_image||'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(s.qr_svg);content.append(qr);$('restart-login').hidden=false;
   }else if(s.setup_required) {
     renderOauthSetup(s).catch(e=>{$('account-message').textContent=e.message;});
+  }else if(s.verification_uri&&s.user_code){
+    const code=document.createElement('input');code.value=s.user_code;code.readOnly=true;code.setAttribute('aria-label','微软设备码');code.onclick=()=>code.select();
+    const link=text('a','打开微软官方登录窗口 ↗','authorize-link');link.href=s.verification_uri;link.target='_blank';link.rel='noopener noreferrer';
+    content.append(text('p','在微软官方页面输入下面的设备码并确认授权。'),code,link,text('small','无需公网 IP、域名、端口映射或回调地址；完成后工作台自动连接。'),button('应用配置',()=>renderOauthSetup(s).catch(e=>toast(e.message))));
   }else if(s.authorize_url) {
     const link=text('a','打开'+(accounts.find(a=>a.id===s.provider)?.name||'网盘')+'官方授权页 ↗','authorize-link');link.href=s.authorize_url;link.target='_blank';link.rel='noopener noreferrer';content.append(link,text('p','在官方页面完成登录并允许授权，工作台会自动连接。'));
     if(['google','onedrive'].includes(s.provider))content.append(button('应用配置',()=>renderOauthSetup(s).catch(e=>toast(e.message))));
@@ -252,20 +256,22 @@ async function renderOauthSetup(s){
   if(loginSession?.id!==s.id)return;
   clearInterval(loginPoll);$('account-expiry').textContent='应用配置由部署者完成一次，保存后立即生效';
   const content=$('account-content');content.replaceChildren();
-  content.append(text('h3','官方登录应用配置'),text('p','由部署者配置一次。之后用户直接登录官方账号，工作台自动连接，无需复制令牌。'));
+  const device=s.mode==='device';
+  content.append(text('h3','官方登录应用配置'),text('p',device?'配置微软应用客户端 ID，并在官方后台启用“允许公共客户端流”。支持个人账号时，应用账号类型也须包含个人微软账号。无需回调地址或客户端密钥。':'由部署者配置一次。之后用户直接登录官方账号，工作台自动连接，无需复制令牌。'));
   const form=text('form','','credential-form');form.id='oauth-setup';
   const inputs={};
-  for(const [name,label,type]of[['client_id','应用客户端 ID','text'],['client_secret','应用客户端密钥','password'],['public_url','工作台 HTTPS 地址','url']]){
+  const fields=device?[['client_id','应用客户端 ID','text']]:[['client_id','应用客户端 ID','text'],['client_secret','应用客户端密钥','password'],['public_url','工作台 HTTPS 地址','url']];
+  for(const [name,label,type]of fields){
     const input=document.createElement('input');input.id='oauth-setup-'+name;input.name=name;input.type=type;input.autocomplete='off';input.required=name!=='client_secret'||!config.has_secret;input.value=name==='client_secret'?'':config[name]||'';
     if(name==='client_secret')input.placeholder=config.has_secret?'已保存；留空保持原密钥':'仅保存在服务器，不会回显';
     if(name==='public_url')input.placeholder='https://download.example.com';
     const title=text('label',label);title.htmlFor=input.id;inputs[name]=input;form.append(title,input);
   }
-  const callback=text('input');callback.id='oauth-setup-callback';callback.readOnly=true;callback.setAttribute('aria-label','官方应用回调地址');
+  if(!device){const callback=text('input');callback.id='oauth-setup-callback';callback.readOnly=true;callback.setAttribute('aria-label','官方应用回调地址');
   const update=()=>{try{callback.value=new URL('/oauth/'+s.provider+'/callback',inputs.public_url.value).href;}catch{callback.value='请先填写工作台 HTTPS 地址';}};inputs.public_url.oninput=update;update();
-  form.append(text('label','在官方应用后台登记以下回调地址'),callback,text('small',s.provider==='google'?'启用 Google Drive API，配置同意屏幕及测试用户，添加 Drive 权限。局域网 IP 不能作为 Google 网页授权回调；本机 localhost 可用于测试。':'注册支持所需个人／组织账号的 Web 应用，添加 Files.ReadWrite.All 和 offline_access 权限。'));
+  form.append(text('label','在官方应用后台登记以下回调地址'),callback,text('small',s.provider==='google'?'启用 Google Drive API，配置同意屏幕及测试用户，添加 Drive 权限。局域网 IP 不能作为 Google 网页授权回调；本机 localhost 可用于测试。':'注册支持所需个人／组织账号的 Web 应用，添加 Files.ReadWrite.All 和 offline_access 权限。'));}
   const save=button('保存并准备官方登录',null,'primary');save.type='submit';form.append(save);
-  form.onsubmit=async event=>{event.preventDefault();save.disabled=true;try{const body=Object.fromEntries(Object.entries(inputs).map(([key,input])=>[key,input.value.trim()]));await api('/accounts/'+s.provider+'/oauth-config',{method:'PUT',body:JSON.stringify(body)});inputs.client_secret.value='';await openAccount(s.provider,'oauth');}catch(e){$('account-message').textContent=e.message;}finally{save.disabled=false;}};
+  form.onsubmit=async event=>{event.preventDefault();save.disabled=true;try{const body={client_secret:'',public_url:'',...Object.fromEntries(Object.entries(inputs).map(([key,input])=>[key,input.value.trim()]))};await api('/accounts/'+s.provider+'/oauth-config',{method:'PUT',body:JSON.stringify(body)});if(inputs.client_secret)inputs.client_secret.value='';await openAccount(s.provider,s.mode);}catch(e){$('account-message').textContent=e.message;}finally{save.disabled=false;}};
   content.append(form);
 }
 window.addEventListener('message',async event=>{

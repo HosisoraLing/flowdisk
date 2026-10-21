@@ -748,6 +748,7 @@ async fn main() -> Result<()> {
         .route("/api/session", post(session))
         .route("/oauth/baidu/callback", get(auth::baidu_callback))
         .route("/oauth/{provider}/callback", get(auth::external_callback))
+        .route("/internal/onedrive/renew", get(auth::microsoft_refresh))
         .route(
             "/oauth/complete.js",
             get(|| async {
