@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let currentPath = '/', page = 1, total = 0, entries = [], roots = [], selected = new Set(), view = 'browse', timer, busy = false;
 let toastTimer, accounts = [], loginSession = null, loginPoll, loginChecking = false, loginRevision = 0, pollCount = 0;
-const labels = {queued:'等待下载',downloading:'正在下载',pausing:'正在暂停',paused:'已暂停',failed:'下载失败',completed:'已完成'};
+const labels = {queued:'等待下载',downloading:'正在下载',pausing:'正在暂停',paused:'已暂停',failed:'下载失败',completed:'已完成',seeding:'正在做种',metadata:'读取种子信息',selecting:'等待选择文件'};
 function text(tag, value, cls) { const el = document.createElement(tag); el.textContent = value; if(cls) el.className = cls; return el; }
 function button(label, action, cls) { const el = text('button', label, cls); el.type = 'button'; el.onclick = action; return el; }
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 5000); }
@@ -119,7 +119,7 @@ function speedChart(job) {
 let collapsedGroups=new Set();
 try{const saved=JSON.parse(localStorage.getItem('flowdisk-collapsed-groups')||'[]');if(Array.isArray(saved))collapsedGroups=new Set(saved.filter(v=>typeof v==='string'));}catch{}
 async function loadJobs() {
-  const [native,external]=await Promise.all([api('/jobs'),api('/transfers')]);const jobs=[...native,...external].sort((a,b)=>b.created_at-a.created_at);transferIds=new Set(external.map(j=>j.id)); const active = jobs.filter(j=>['downloading','queued','pausing'].includes(j.status));
+  const [native,external]=await Promise.all([api('/jobs'),api('/transfers')]);const jobs=[...native,...external].sort((a,b)=>b.created_at-a.created_at);transferIds=new Set(external.map(j=>j.id)); const active = jobs.filter(j=>['downloading','queued','pausing','seeding','metadata'].includes(j.status));
   $('task-count').textContent = jobs.length; $('total-speed').textContent = bytes(jobs.reduce((n,j)=>n+j.speed,0))+'/s'; $('active-count').textContent = active.length; $('completed-count').textContent = jobs.filter(j=>j.status==='completed').length;
   if(view !== 'tasks' && !$('tasks').children.length && !jobs.length) return;
   $('tasks').replaceChildren(); $('no-tasks').hidden = !!jobs.length;
@@ -136,10 +136,10 @@ async function loadJobs() {
   }
   for(const job of jobs) {
     const task = text('article','','task'); const top = text('div','','task-top'); const title = text('div','','task-title'); title.append(text('strong',job.name),text('small',job.path)); if(job.passwords?.length&&typeof passwordNotes==='function')title.append(passwordNotes(job.passwords)); const actions = text('div','','task-actions');
-    if(['downloading','queued'].includes(job.status)) actions.append(button('暂停',()=>jobAction(job.id,'pause')));
+    if(['downloading','queued','seeding','metadata'].includes(job.status)) actions.append(button('暂停',()=>jobAction(job.id,'pause')));
     if(['paused','failed'].includes(job.status)) actions.append(button(job.status==='failed'?'重试':'继续',()=>jobAction(job.id,'resume')));
     if(job.engine==='aria2'){appendTransferActions(job,actions);}else if(job.status==='completed') { const link = text('a','保存到设备'); link.href = `/api/jobs/${job.id}/file`; link.setAttribute('download',job.name); actions.append(link); }
-    if(!['downloading','queued','pausing'].includes(job.status)) actions.append(button('移除记录',()=>jobAction(job.id,'')));
+    if(!['downloading','queued','pausing','seeding','metadata'].includes(job.status)) actions.append(button('移除记录',()=>jobAction(job.id,'')));
     top.append(title,actions); const progress = text('div','','progress'); const fill = document.createElement('div'); const pct = job.status==='completed'?100:job.size ? Math.min(100,100*job.downloaded/job.size) : 0; fill.style.width = pct+'%'; progress.append(fill);
     const info = text('div','','task-info'); info.append(text('span',`${labels[job.status]||job.status} · ${bytes(job.downloaded)} / ${bytes(job.size)} · ${pct.toFixed(1)}%`),text('span',job.status==='downloading'?`${bytes(job.speed)}/s · 最多 ${job.connections} 连接`:'')); task.append(top,progress,info);
     const metrics=text('div','','speed-metrics');
@@ -161,6 +161,7 @@ async function loadJobs() {
         eta.textContent=`预计剩余 ${duration} · 预计完成 ${new Date(Date.now()+seconds*1000).toLocaleString()}（随速度更新）`;
       } else eta.textContent='正在估算完成时间…';
     }
+    if(job.engine==='aria2'&&['torrent','magnet'].includes(job.kind))task.append(text('p',`上传 ${bytes(job.upload_speed)}/s · 累计上传 ${bytes(job.uploaded)} · 分享率 ${job.share_ratio.toFixed(2)} · 连接 ${job.peers} / 做种 ${job.seeders} · 分片 ${job.completed_pieces}/${job.pieces}`,'bt-stats'));
     task.append(metrics,speedChart(job),eta);
     if(job.error) task.append(text('p',job.error,'task-error')); if(job.sha256) task.append(text('p','SHA-256 '+job.sha256,'checksum')); (destinations.get(job.group_id||('single:'+job.id))||$('tasks')).append(task);
   }

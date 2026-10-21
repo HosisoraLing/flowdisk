@@ -40,6 +40,20 @@ pub struct Transfer {
     gid: String,
     uri: String,
     headers: BTreeMap<String, String>,
+    #[serde(default)]
+    torrent: String,
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    peers: u64,
+    #[serde(default)]
+    seeders: u64,
+    #[serde(default)]
+    pieces: u64,
+    #[serde(default)]
+    completed_pieces: u64,
+    #[serde(default)]
+    seed_ms: u64,
     pub kind: String,
     pub name: String,
     status: String,
@@ -63,7 +77,7 @@ pub struct Transfer {
 }
 impl Transfer {
     fn public(&self) -> Value {
-        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if matches!(self.status.as_str(),"downloading"|"seeding"){self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
+        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if matches!(self.status.as_str(),"downloading"|"seeding"){self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"peers":self.peers,"seeders":self.seeders,"pieces":self.pieces,"completed_pieces":self.completed_pieces,"seed_ms":self.seed_ms,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
     }
 }
 pub struct Transfers {
@@ -81,6 +95,9 @@ pub struct Transfers {
     pub sent_delta: AtomicU64,
 }
 fn display_uri(raw: &str) -> String {
+    if raw.starts_with("magnet:") {
+        return "magnet · BitTorrent".into();
+    }
     if let Ok(mut url) = Url::parse(raw) {
         url.set_query(None);
         url.set_fragment(None);
@@ -177,7 +194,7 @@ impl Transfers {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(6888);
         let contents = format!(
-            "enable-rpc=true\nrpc-listen-all=false\nrpc-listen-port={port}\nrpc-secret={secret}\nrpc-save-upload-metadata=true\nenable-console-readout=false\nquiet=true\nconsole-log-level=error\nlog-level=error\nfile-allocation=none\ncontinue=true\nauto-file-renaming=false\nallow-overwrite=false\nsplit=8\nmax-connection-per-server=8\nmin-split-size=4M\nmax-concurrent-downloads=3\nmax-download-result=2000\nmax-tries=5\nretry-wait=2\nconnect-timeout=15\ntimeout=30\ncheck-certificate=true\nno-netrc=true\npause=true\npause-metadata=true\nfollow-torrent=false\nfollow-metalink=false\nseed-ratio=1.0\nseed-time=60\nlisten-port={bt_port}\ndht-listen-port={bt_port}\ndht-file-path={}\ndht-file-path6={}\ninput-file={}\nsave-session={}\nsave-session-interval=5\nauto-save-interval=5\nforce-save=true\ndir={}\n",
+            "enable-rpc=true\nrpc-listen-all=false\nrpc-listen-port={port}\nrpc-secret={secret}\nrpc-save-upload-metadata=true\nenable-console-readout=false\nquiet=true\nconsole-log-level=error\nlog-level=error\nfile-allocation=none\ncontinue=true\nauto-file-renaming=false\nallow-overwrite=false\nsplit=8\nmax-connection-per-server=8\nmin-split-size=4M\nmax-concurrent-downloads=3\nmax-download-result=2000\nmax-tries=5\nretry-wait=2\nconnect-timeout=15\ntimeout=30\ncheck-certificate=true\nno-netrc=true\nbt-save-metadata=true\npause=true\npause-metadata=true\nfollow-torrent=false\nfollow-metalink=false\nseed-ratio=1.0\nseed-time=60\nlisten-port={bt_port}\ndht-listen-port={bt_port}\ndht-file-path={}\ndht-file-path6={}\ninput-file={}\nsave-session={}\nsave-session-interval=5\nauto-save-interval=5\nforce-save=true\ndir={}\n",
             data.join("dht.dat").display(),
             data.join("dht6.dat").display(),
             session.display(),
@@ -296,9 +313,24 @@ impl Transfers {
         let mut tasks = self.tasks.lock().await;
         let mut downloading = false;
         for t in tasks.values_mut().filter(|t| !t.hidden) {
-            let Ok(v) = self.rpc("tellStatus", json!([t.gid])).await else {
+            let Ok(mut v) = self.rpc("tellStatus", json!([t.gid])).await else {
                 continue;
             };
+            if let Some(child) = v["followedBy"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+            {
+                let next = child.to_owned();
+                if let Ok(child_state) = self.rpc("tellStatus", json!([next])).await {
+                    t.gid = next;
+                    t.kind = "torrent".into();
+                    t.approved = false;
+                    t.last_received = 0;
+                    t.last_sent = 0;
+                    v = child_state;
+                }
+            }
             let status = v["status"].as_str().unwrap_or("paused");
             let total = number(&v, "totalLength");
             let completed = number(&v, "completedLength");
@@ -310,7 +342,29 @@ impl Transfers {
                 _ => "paused",
             }
             .into();
-            downloading |= matches!(t.status.as_str(), "downloading" | "queued");
+            let is_bt =
+                v["bittorrent"].is_object() || matches!(t.kind.as_str(), "magnet" | "torrent");
+            if is_bt && status == "active" && total > 0 && completed >= total {
+                t.status = "seeding".into();
+                t.seed_ms = t.seed_ms.saturating_add(elapsed_ms);
+            }
+            if is_bt && status == "active" && total == 0 {
+                t.status = "metadata".into();
+            }
+            downloading |= matches!(t.status.as_str(), "downloading" | "queued" | "metadata");
+            t.peers = number(&v, "connections");
+            t.seeders = number(&v, "numSeeders");
+            t.pieces = number(&v, "numPieces");
+            t.completed_pieces = v["bitfield"]
+                .as_str()
+                .map(|b| {
+                    b.chars()
+                        .filter_map(|c| c.to_digit(16))
+                        .map(u32::count_ones)
+                        .sum::<u32>() as u64
+                })
+                .unwrap_or(0)
+                .min(t.pieces);
             let received = completed.saturating_sub(t.last_received);
             t.last_received = completed;
             let sent = number(&v, "uploadLength");
@@ -325,6 +379,11 @@ impl Transfers {
             self.sent_delta.fetch_add(delta_sent, Ordering::Relaxed);
             if status == "active" {
                 t.stats.record(received, elapsed_ms, now() * 1000);
+                let speed = number(&v, "downloadSpeed");
+                t.stats.peak_speed = t.stats.peak_speed.max(speed);
+                if let Some(point) = t.stats.speed_history.last_mut() {
+                    point.speed = speed;
+                }
             }
             t.upload_speed = number(&v, "uploadSpeed");
             t.peak_upload_speed = t.peak_upload_speed.max(t.upload_speed);
@@ -366,7 +425,33 @@ impl Transfers {
                         }
                     }
                 }
+                if list.len() > 5000 {
+                    let _ = self.rpc("forcePause", json!([t.gid])).await;
+                    t.status = "failed".into();
+                    t.error = Some("种子超过 5000 个文件，请拆分后添加".into());
+                    list.truncate(5000);
+                }
                 t.files = list;
+                if is_bt {
+                    t.size = t
+                        .files
+                        .iter()
+                        .filter(|f| f.selected)
+                        .map(|f| f.length)
+                        .sum();
+                    t.downloaded = t
+                        .files
+                        .iter()
+                        .filter(|f| f.selected)
+                        .map(|f| f.completed)
+                        .sum();
+                    if !t.approved && status == "paused" && !t.files.is_empty() {
+                        t.status = "selecting".into();
+                    }
+                    if let Some(name) = v["bittorrent"]["info"]["name"].as_str() {
+                        t.name = name.to_owned();
+                    }
+                }
                 if t.files.len() == 1 {
                     t.name = t.files[0].name.clone();
                 }
@@ -374,6 +459,31 @@ impl Transfers {
         }
         self.downloading.store(downloading, Ordering::Relaxed);
         self.persist(&tasks).await
+    }
+    async fn add(&self, task: &Transfer, paused: bool) -> Result<()> {
+        let folder = self.downloads.join(task.id.to_string());
+        fs::create_dir_all(&folder).await?;
+        let mut options = json!({"gid":task.gid,"dir":folder.to_string_lossy(),"pause":if paused{"true"}else{"false"},"header":task.headers.iter().map(|(k,v)|format!("{k}: {v}")).collect::<Vec<_>>(),"pause-metadata":"true","follow-torrent":"true","follow-metalink":"false"});
+        if !matches!(task.kind.as_str(), "torrent" | "magnet") {
+            options["out"] = task.name.clone().into();
+        }
+        if task.approved && !task.files.is_empty() {
+            options["select-file"] = task
+                .files
+                .iter()
+                .filter(|f| f.selected)
+                .map(|f| f.index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into();
+        }
+        if !task.torrent.is_empty() {
+            self.rpc("addTorrent", json!([task.torrent, [], options]))
+                .await?;
+        } else {
+            self.rpc("addUri", json!([[task.uri], options])).await?;
+        }
+        Ok(())
     }
     pub async fn shutdown(&self) {
         if self.available() {
@@ -394,7 +504,10 @@ impl Transfers {
 }
 #[derive(Deserialize)]
 struct Input {
+    #[serde(default)]
     uri: String,
+    #[serde(default)]
+    torrent_base64: String,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -406,17 +519,41 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
     if !app.0.transfers.available() {
         return Err(bad("链接下载引擎不可用，请使用含 aria2 的 Docker 镜像"));
     }
-    let url = link(input.uri.trim())
-        .map_err(|_| bad("不支持此下载链接，请填写 HTTP、HTTPS、FTP 或 SFTP 地址"))?;
-    if !app
-        .0
-        .transfers
-        .protocols()
-        .iter()
-        .any(|p| p == url.scheme())
-    {
-        return Err(bad("当前引擎未编译这个协议"));
-    }
+    use base64::Engine;
+    let uploaded = !input.torrent_base64.is_empty();
+    let magnet = input.uri.trim().starts_with("magnet:");
+    let url = if uploaded {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&input.torrent_base64)
+            .map_err(|_| bad("种子文件编码无效"))?;
+        if bytes.len() > 8 * 1024 * 1024 || bytes.first() != Some(&b'd') {
+            return Err(bad("请选择不超过 8 MiB 的 .torrent 文件"));
+        }
+        Url::parse("https://example.invalid/torrent").unwrap()
+    } else if magnet {
+        let u = Url::parse(input.uri.trim()).map_err(|_| bad("磁力链接无效"))?;
+        let supported = u.query_pairs().filter(|(k, _)| k == "xt").any(|(_, v)| {
+            v.strip_prefix("urn:btih:").is_some_and(|h| {
+                (h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    || (h.len() == 32
+                        && h.bytes()
+                            .all(|b| b.is_ascii_alphabetic() || (b'2'..=b'7').contains(&b)))
+            })
+        });
+        if input.uri.len() > 16384 || !supported {
+            return Err(bad(
+                "需要包含有效 BT v1 info-hash 的磁力链接，暂不支持仅 BT v2 的磁力链接",
+            ));
+        }
+        u
+    } else {
+        let u =
+            link(input.uri.trim()).map_err(|_| bad("请填写 HTTP/HTTPS/FTP/SFTP 或 magnet 链接"))?;
+        if !app.0.transfers.protocols().iter().any(|p| p == u.scheme()) {
+            return Err(bad("当前引擎未编译这个协议"));
+        }
+        u
+    };
     if input.headers.len() > 4
         || input.headers.iter().any(|(k, v)| {
             !["user-agent", "referer", "authorization", "cookie"]
@@ -451,9 +588,23 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
         gid: gid.clone(),
         uri: input.uri.trim().into(),
         headers: input.headers,
-        kind: url.scheme().into(),
+        torrent: input.torrent_base64,
+        approved: !uploaded && !magnet,
+        peers: 0,
+        seeders: 0,
+        pieces: 0,
+        completed_pieces: 0,
+        seed_ms: 0,
+        kind: if uploaded { "torrent" } else { url.scheme() }.into(),
         name: name.clone(),
-        status: "queued".into(),
+        status: if uploaded {
+            "selecting"
+        } else if magnet {
+            "metadata"
+        } else {
+            "queued"
+        }
+        .into(),
         files: vec![],
         group_id,
         group_name,
@@ -477,15 +628,7 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
     tasks.insert(id, task.clone());
     app.0.transfers.persist(&tasks).await?;
     drop(tasks);
-    let folder = app.0.transfers.downloads.join(id.to_string());
-    fs::create_dir_all(&folder).await?;
-    let options = json!({"gid":gid,"dir":folder.to_string_lossy(),"out":name,"pause":"false","header":task.headers.iter().map(|(k,v)|format!("{k}: {v}")).collect::<Vec<_>>(),"follow-torrent":"false","follow-metalink":"false"});
-    if let Err(error) = app
-        .0
-        .transfers
-        .rpc("addUri", json!([[task.uri], options]))
-        .await
-    {
+    if let Err(error) = app.0.transfers.add(&task, uploaded).await {
         let mut tasks = app.0.transfers.tasks.lock().await;
         if let Some(t) = tasks.get_mut(&id) {
             t.status = "failed".into();
@@ -515,9 +658,72 @@ async fn resume(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<
     if task.hidden || task.status == "completed" {
         return Err(bad("任务已结束"));
     }
-    app.0.transfers.rpc("unpause", json!([task.gid])).await?;
+    if !task.approved && !task.files.is_empty() {
+        return Err(bad("请先选择种子文件，再开始下载"));
+    }
+    if app
+        .0
+        .transfers
+        .rpc("unpause", json!([task.gid]))
+        .await
+        .is_err()
+    {
+        let _ = app
+            .0
+            .transfers
+            .rpc("removeDownloadResult", json!([task.gid]))
+            .await;
+        task.gid = Uuid::new_v4().simple().to_string()[..16].into();
+        app.0.transfers.add(task, false).await?;
+    }
+
     task.status = "queued".into();
     task.error = None;
+    app.0.transfers.persist(&tasks).await?;
+    app.0.transfers.downloading.store(true, Ordering::Relaxed);
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+struct Selection {
+    indices: Vec<u64>,
+}
+async fn select(
+    State(app): State<App>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<Selection>,
+) -> ApiResult<Json<Value>> {
+    let mut tasks = app.0.transfers.tasks.lock().await;
+    let t = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
+    if !matches!(t.status.as_str(), "selecting" | "paused") || t.hidden {
+        return Err(bad("请先暂停任务再调整文件范围"));
+    }
+    if input.indices.is_empty()
+        || input.indices.len() > 5000
+        || input
+            .indices
+            .iter()
+            .any(|i| !t.files.iter().any(|f| f.index == *i))
+    {
+        return Err(bad("请选择有效的下载文件"));
+    }
+    let selected = input
+        .indices
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    app.0
+        .transfers
+        .rpc("changeOption", json!([t.gid,{"select-file":selected}]))
+        .await?;
+    t.approved = true;
+    for f in &mut t.files {
+        f.selected = input.indices.contains(&f.index);
+    }
+    app.0.transfers.persist(&tasks).await?;
+    let t = tasks.get_mut(&id).unwrap();
+    app.0.transfers.rpc("unpause", json!([t.gid])).await?;
+    t.status = "queued".into();
     app.0.transfers.persist(&tasks).await?;
     app.0.transfers.downloading.store(true, Ordering::Relaxed);
     Ok(Json(json!({"ok":true})))
@@ -534,7 +740,10 @@ async fn remove(
 ) -> ApiResult<Json<Value>> {
     let mut tasks = app.0.transfers.tasks.lock().await;
     let task = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
-    if matches!(task.status.as_str(), "downloading" | "queued" | "seeding") {
+    if matches!(
+        task.status.as_str(),
+        "downloading" | "queued" | "seeding" | "metadata"
+    ) {
         return Err(bad("请先暂停下载或做种，再移除任务"));
     }
     let _ = app.0.transfers.rpc("forceRemove", json!([task.gid])).await;
@@ -614,8 +823,9 @@ pub fn routes() -> Router<App> {
         .route("/transfers/status", get(status))
         .route("/transfers/files", get(files))
         .route("/transfers/{id}", axum::routing::delete(remove))
+        .route("/transfers/{id}/select", post(select))
         .route("/transfers/{id}/pause", post(pause))
         .route("/transfers/{id}/resume", post(resume))
         .route("/transfers/{id}/files/{index}", get(file))
-        .layer(DefaultBodyLimit::max(128 * 1024))
+        .layer(DefaultBodyLimit::max(12 * 1024 * 1024))
 }

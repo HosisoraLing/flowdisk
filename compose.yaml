@@ -43,6 +43,7 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
+      BT_PORT: ${BT_PORT:-6888}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       HTTPS_PROXY: ${CLOUD_HTTPS_PROXY:-}
       HTTP_PROXY: ${CLOUD_HTTP_PROXY:-}
@@ -53,6 +54,8 @@ services:
       - ./downloads:/downloads
     ports:
       - "${BIND_IP:-127.0.0.1}:${APP_PORT:-8080}:8080"
+      - "${BT_PORT:-6888}:${BT_PORT:-6888}/tcp"
+      - "${BT_PORT:-6888}:${BT_PORT:-6888}/udp"
     stop_grace_period: 60s
     security_opt:
       - no-new-privileges:true
