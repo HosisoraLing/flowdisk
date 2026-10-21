@@ -1,11 +1,11 @@
 //! An isolated aria2 subprocess handles ordinary link downloads. Its RPC never
 //! listens outside loopback; only typed, authenticated FlowDisk routes reach it.
-use crate::{ApiError, ApiResult, App, SpeedStats, bad, now, safe_name};
+use crate::{ApiResult, App, SpeedStats, bad, now, safe_name};
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method},
     response::Response,
     routing::{get, post},
 };
@@ -17,7 +17,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     fs,
@@ -792,11 +792,11 @@ async fn file(
         .to_string_lossy()
         .to_string();
     let real = fs::canonicalize(&path).await?;
-    ensure!(
-        real.starts_with(fs::canonicalize(&root).await?)
-            && !fs::symlink_metadata(&path).await?.file_type().is_symlink(),
-        "本地文件路径无效"
-    );
+    if !real.starts_with(fs::canonicalize(&root).await?)
+        || fs::symlink_metadata(&path).await?.file_type().is_symlink()
+    {
+        return Err(bad("本地文件路径无效"));
+    }
     drop(tasks);
     crate::serve_file::send(&real, &name, &headers, method == Method::HEAD).await
 }
