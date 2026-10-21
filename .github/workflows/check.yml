@@ -1,0 +1,16 @@
+name: Rust checks
+on:
+  push:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/check.yml']
+  pull_request:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/check.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo test --locked

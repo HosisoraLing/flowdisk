@@ -1,0 +1,16 @@
+/target/
+/data/
+/downloads/
+/work/
+/.env
+/.env.*
+!/.env.example
+*.log
+*.sqlite*
+*.db
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.DS_Store
+/.playwright-cli/

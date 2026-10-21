@@ -1,0 +1,23 @@
+[package]
+name = "flowdisk"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Rust cloud-drive downloader with a desktop web UI, resumable transfers and Docker deployment"
+repository = "https://github.com/HosisoraLing/flowdisk"
+
+[dependencies]
+anyhow = "1"
+md5 = "0.8"
+base64 = "0.22"
+axum = "0.8"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+uuid = { version = "=1.18.1", features = ["v4", "serde"] }

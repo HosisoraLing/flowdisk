@@ -1,0 +1,62 @@
+services:
+  openlist:
+    image: openlistteam/openlist:v4.2.6
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      OPENLIST_ADMIN_PASSWORD: ${OPENLIST_PASSWORD:?请先运行 ./setup.sh}
+      UMASK: "077"
+      HTTPS_PROXY: ${CLOUD_HTTPS_PROXY:-}
+      HTTP_PROXY: ${CLOUD_HTTP_PROXY:-}
+      NO_PROXY: ${CLOUD_NO_PROXY:-openlist,localhost,127.0.0.1}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/openlist:/opt/openlist/data
+    ports:
+      - "127.0.0.1:${OPENLIST_PORT:-5244}:5244"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+  downloader:
+    build: .
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    depends_on:
+      openlist:
+        condition: service_started
+    environment:
+      APP_TOKEN: ${APP_TOKEN:?请先运行 ./setup.sh}
+      OPENLIST_URL: http://openlist:5244
+      OPENLIST_USERNAME: admin
+      OPENLIST_PASSWORD: ${OPENLIST_PASSWORD:?请先运行 ./setup.sh}
+      CONNECTIONS_PER_FILE: ${CONNECTIONS_PER_FILE:-8}
+      ACTIVE_DOWNLOADS: ${ACTIVE_DOWNLOADS:-2}
+      GLOBAL_CONNECTIONS: ${GLOBAL_CONNECTIONS:-24}
+      BAIDU_CONNECTIONS: ${BAIDU_CONNECTIONS:-}
+      BAIDU_CLIENT_ID: ${BAIDU_CLIENT_ID:-}
+      BAIDU_CLIENT_SECRET: ${BAIDU_CLIENT_SECRET:-}
+      ONEDRIVE_CLIENT_ID: ${ONEDRIVE_CLIENT_ID:-}
+      ONEDRIVE_CLIENT_SECRET: ${ONEDRIVE_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      HTTPS_PROXY: ${CLOUD_HTTPS_PROXY:-}
+      HTTP_PROXY: ${CLOUD_HTTP_PROXY:-}
+      NO_PROXY: ${CLOUD_NO_PROXY:-openlist,localhost,127.0.0.1}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/flowdisk:/data
+      - ./downloads:/downloads
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
