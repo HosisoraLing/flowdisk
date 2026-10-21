@@ -90,7 +90,7 @@ impl Control {
             }
         }
         Ok(Self {
-            auth: crate::auth::Auth::new()?,
+            auth: crate::auth::Auth::with_data(data)?,
             shares: Mutex::new(shares),
             active: Mutex::new(BTreeSet::new()),
             logins: Mutex::new(BTreeMap::new()),
@@ -1195,6 +1195,10 @@ pub fn routes() -> Router<App> {
         .route("/connections/{id}", axum::routing::delete(disconnect_smb))
         .route("/accounts", get(accounts))
         .route("/accounts/{key}/login", post(login))
+        .route(
+            "/accounts/{key}/oauth-config",
+            get(crate::auth::oauth_settings).put(crate::auth::save_oauth_settings),
+        )
         .route("/accounts/{key}", axum::routing::delete(disconnect))
         .route("/logins/{id}", get(login_status).delete(close_login))
         .route("/logins/{id}/action", post(login_action))

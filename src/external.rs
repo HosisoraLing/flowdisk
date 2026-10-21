@@ -44,25 +44,56 @@ pub fn oauth_config(provider: &str) -> Result<(String, String, String)> {
     } else {
         "GOOGLE"
     };
-    let id = std::env::var(format!("{prefix}_CLIENT_ID"))?;
-    let secret = std::env::var(format!("{prefix}_CLIENT_SECRET"))?;
-    let base = Url::parse(&std::env::var("PUBLIC_URL")?)?;
-    ensure!(
-        !id.trim().is_empty()
-            && !secret.trim().is_empty()
-            && base.username().is_empty()
-            && base.password().is_none()
-            && (base.scheme() == "https"
-                || (base.scheme() == "http"
-                    && matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))),
-        "官方授权需要 HTTPS PUBLIC_URL（本机 localhost 除外）"
-    );
-    Ok((
-        id,
-        secret,
-        base.join(&format!("/oauth/{provider}/callback"))?
-            .to_string(),
-    ))
+    OAuthConfig {
+        client_id: std::env::var(format!("{prefix}_CLIENT_ID"))?,
+        client_secret: std::env::var(format!("{prefix}_CLIENT_SECRET"))?,
+        public_url: std::env::var("PUBLIC_URL")?,
+    }
+    .resolve(provider)
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct OAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub public_url: String,
+}
+impl OAuthConfig {
+    pub fn resolve(&self, provider: &str) -> Result<(String, String, String)> {
+        ensure!(["onedrive", "google"].contains(&provider), "不支持的网盘");
+        let base = Url::parse(&self.public_url)?;
+        ensure!(
+            !self.client_id.trim().is_empty()
+                && !self.client_secret.trim().is_empty()
+                && self.client_id.len() <= 2000
+                && self.client_secret.len() <= 2000
+                && !self.client_id.contains(['\r', '\n'])
+                && !self.client_secret.contains(['\r', '\n'])
+                && self.public_url.len() <= 2000
+                && base.username().is_empty()
+                && base.password().is_none()
+                && base.query().is_none()
+                && base.fragment().is_none()
+                && (base.scheme() == "https"
+                    || (base.scheme() == "http"
+                        && matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))),
+            "官方授权需要 HTTPS PUBLIC_URL（本机 localhost 除外）"
+        );
+        if provider == "google" {
+            ensure!(
+                base.host_str().is_some_and(|host| host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .map_or(true, |ip| ip.is_loopback())),
+                "Google 网页授权需要域名，不能使用局域网 IP 作为回调地址"
+            );
+        }
+        Ok((
+            self.client_id.clone(),
+            self.client_secret.clone(),
+            base.join(&format!("/oauth/{provider}/callback"))?
+                .to_string(),
+        ))
+    }
 }
 pub fn credential(provider: &str, token: &str, body: &Value) -> Result<Value> {
     ensure!(["onedrive", "google"].contains(&provider), "不支持的网盘");

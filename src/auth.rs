@@ -3,7 +3,7 @@
 use crate::{ApiError, ApiResult, App, bad, now};
 use anyhow::{Result, ensure};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
@@ -23,6 +23,7 @@ pub struct Auth {
     sms_sent: Mutex<BTreeMap<String, u64>>,
     sessions: Mutex<BTreeMap<Uuid, Session>>,
     credentials: Mutex<BTreeMap<String, Value>>,
+    oauth_clients: Mutex<BTreeMap<String, crate::external::OAuthConfig>>,
 }
 struct Session {
     id: Uuid,
@@ -171,7 +172,29 @@ impl Auth {
             sms_sent: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             credentials: Mutex::new(BTreeMap::new()),
+            oauth_clients: Mutex::new(BTreeMap::new()),
         })
+    }
+    pub fn with_data(data: &std::path::Path) -> Result<Self> {
+        let mut auth = Self::new()?;
+        match std::fs::read(data.join("oauth-clients.json")) {
+            Ok(raw) => {
+                auth.oauth_clients = Mutex::new(
+                    serde_json::from_slice(&raw)
+                        .map_err(|_| anyhow::anyhow!("OAuth 应用配置损坏，拒绝覆盖"))?,
+                )
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(auth)
+    }
+    async fn external_oauth_config(&self, provider: &str) -> Result<(String, String, String)> {
+        if let Some(config) = self.oauth_clients.lock().await.get(provider) {
+            config.resolve(provider)
+        } else {
+            crate::external::oauth_config(provider)
+        }
     }
     async fn http(
         &self,
@@ -405,7 +428,9 @@ impl Auth {
                 s.message = "在百度官方授权页选择短信或扫码登录，然后允许访问网盘".into();
             }
             ("onedrive" | "google", "oauth") => {
-                if let Ok((id, _, callback)) = crate::external::oauth_config(key) {
+                if let Ok((id, secret, callback)) = self.external_oauth_config(key).await {
+                    s.private["oauth_client"] =
+                        json!({"client_id":id,"client_secret":secret,"callback":callback});
                     let (endpoint, scope) = crate::external::oauth_endpoints(key);
                     let verifier =
                         format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -436,15 +461,14 @@ impl Auth {
                     s.message = "在网盘官方页面登录并授权，完成后工作台会自动连接".into();
                 } else {
                     s.public["setup_required"] = true.into();
-                    s.public["helper_url"] = "https://api.oplist.org/".into();
-                    s.message = "尚未配置自建 OAuth 应用。可用 OpenList 授权助手获取刷新令牌，再切换已有授权连接；或由部署者按 README 配置官方授权".into();
+                    s.message = "请先在工作台配置官方授权应用；配置完成后直接登录 Google / 微软，工作台会自动连接网盘".into();
                 }
             }
             (_, "credential") => {
                 s.message = match key {
                     "baidu" => "粘贴百度刷新令牌即可连接；可通过 OpenList 授权助手获取",
                     "onedrive" | "google" => {
-                        "粘贴 OpenList 授权助手的刷新令牌；也可以选择自建应用并填写对应客户端信息"
+                        "推荐使用官方授权自动连接；也可导入已有刷新令牌和对应客户端信息"
                     }
                     "thunder" => {
                         "粘贴迅雷刷新令牌；如令牌来自不同客户端，请一并填写客户端 ID 和密钥"
@@ -1208,6 +1232,70 @@ pub async fn baidu_callback(State(app): State<App>, Query(q): Query<Callback>) -
     }
     match complete(&app,q).await {Ok(())=>Html("<!doctype html><meta charset=utf-8><title>授权完成</title><p>百度授权已完成，可以关闭此页并返回工作台。</p><a href=/ >返回工作台</a>").into_response(),Err(e)=>e.into_response()}
 }
+pub async fn oauth_settings(
+    State(app): State<App>,
+    Path(provider): Path<String>,
+) -> ApiResult<axum::Json<Value>> {
+    if !["google", "onedrive"].contains(&provider.as_str()) {
+        return Err(bad("不支持的网盘"));
+    }
+    let configs = app.0.control.native_auth().oauth_clients.lock().await;
+    let config = configs.get(&provider).cloned().unwrap_or_else(|| {
+        let prefix = if provider == "google" {
+            "GOOGLE"
+        } else {
+            "ONEDRIVE"
+        };
+        crate::external::OAuthConfig {
+            client_id: std::env::var(format!("{prefix}_CLIENT_ID")).unwrap_or_default(),
+            client_secret: std::env::var(format!("{prefix}_CLIENT_SECRET")).unwrap_or_default(),
+            public_url: std::env::var("PUBLIC_URL").unwrap_or_default(),
+        }
+    });
+    Ok(axum::Json(
+        json!({"client_id":config.client_id,"public_url":config.public_url,"has_secret":!config.client_secret.is_empty(),"configured":config.resolve(&provider).is_ok()}),
+    ))
+}
+pub async fn save_oauth_settings(
+    State(app): State<App>,
+    Path(provider): Path<String>,
+    axum::Json(mut config): axum::Json<crate::external::OAuthConfig>,
+) -> ApiResult<axum::Json<Value>> {
+    if !["google", "onedrive"].contains(&provider.as_str()) {
+        return Err(bad("不支持的网盘"));
+    }
+    let auth = app.0.control.native_auth();
+    let mut configs = auth.oauth_clients.lock().await;
+    if config.client_secret.is_empty() {
+        if let Some(previous) = configs
+            .get(&provider)
+            .filter(|c| c.client_id == config.client_id)
+        {
+            config.client_secret.clone_from(&previous.client_secret);
+        } else if let Ok((id, secret, _)) = crate::external::oauth_config(&provider)
+            && id == config.client_id
+        {
+            config.client_secret = secret;
+        }
+    }
+    let (_, _, callback) = config.resolve(&provider).map_err(|e| bad(&e.to_string()))?;
+    let mut next = configs.clone();
+    next.insert(provider, config);
+    let path = app.0.data.join("oauth-clients.json");
+    let temp = path.with_extension("tmp");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temp).await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&serde_json::to_vec(&next).map_err(anyhow::Error::from)?)
+        .await?;
+    drop(file);
+    tokio::fs::rename(temp, path).await?;
+    *configs = next;
+    Ok(axum::Json(json!({"ok":true,"callback_uri":callback})))
+}
 pub async fn external_callback(
     State(app): State<App>,
     axum::extract::Path(provider): axum::extract::Path<String>,
@@ -1233,8 +1321,16 @@ pub async fn external_callback(
             return Err(bad("已取消授权"));
         }
         let code = q.code.ok_or_else(|| bad("缺少授权回执"))?;
-        let (id, secret, callback) =
-            crate::external::oauth_config(provider).map_err(|_| bad("OAuth 配置不完整"))?;
+        let client = &s.private["oauth_client"];
+        let id = client["client_id"]
+            .as_str()
+            .ok_or_else(|| bad("OAuth 配置不完整"))?;
+        let secret = client["client_secret"]
+            .as_str()
+            .ok_or_else(|| bad("OAuth 配置不完整"))?;
+        let callback = client["callback"]
+            .as_str()
+            .ok_or_else(|| bad("OAuth 配置不完整"))?;
         let token_url = crate::external::token_endpoint(provider);
         let response = app
             .0
@@ -1243,9 +1339,9 @@ pub async fn external_callback(
             .post(token_url)
             .form(&[
                 ("grant_type", "authorization_code"),
-                ("client_id", &id),
-                ("client_secret", &secret),
-                ("redirect_uri", &callback),
+                ("client_id", id),
+                ("client_secret", secret),
+                ("redirect_uri", callback),
                 ("code", &code),
                 (
                     "code_verifier",
@@ -1267,7 +1363,7 @@ pub async fn external_callback(
         Ok(())
     }
     match complete(&app, &provider, q).await {
-        Ok(()) => Html("<!doctype html><meta charset=utf-8><title>授权完成</title><p>授权已完成，可以关闭此页并返回工作台。</p><a href=/>返回工作台</a>").into_response(),
+        Ok(()) => Html("<!doctype html><meta charset=utf-8><title>授权完成</title><script src=/oauth/complete.js defer></script><p>授权已完成，工作台将自动连接。此窗口会自动关闭。</p><a href=/>返回工作台</a>").into_response(),
         Err(e) => e.into_response(),
     }
 }

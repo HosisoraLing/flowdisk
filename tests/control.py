@@ -104,7 +104,7 @@ def main():
             assert {a['id'] for a in accounts}=={'baidu','quark','115','thunder','onedrive','google'}
             for provider in ['onedrive','google']:
                 session=app.api('/accounts/'+provider+'/login',{'mode':'oauth'})
-                assert session.get('setup_required') and session['helper_url']=='https://api.oplist.org/'
+                assert session.get('setup_required') and 'helper_url' not in session
                 reject(app,f'/logins/{session["id"]}/action',{'secret':'private-refresh'})
                 # Callback is state-bound even without an app credential configured.
                 try:urllib.request.urlopen(app.base+'/oauth/'+('google' if provider=='onedrive' else 'onedrive')+'/callback?state='+session['id']+'&code=untrusted')
