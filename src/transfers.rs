@@ -78,12 +78,26 @@ pub struct Transfer {
     pub(crate) hidden: bool,
     #[serde(default)]
     pub(crate) destination: Option<String>,
+    #[serde(default)]
+    seed_check: bool,
+    #[serde(default)]
+    seed_only: bool,
+    #[serde(default)]
+    seed_forgotten: bool,
+    #[serde(default)]
+    seed_error: Option<String>,
+    #[serde(default)]
+    info_hash: String,
+    #[serde(default)]
+    seed_policy_ratio: f64,
+    #[serde(default)]
+    seed_policy_minutes: u64,
     #[serde(flatten)]
     stats: SpeedStats,
 }
 impl Transfer {
     fn public(&self) -> Value {
-        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if matches!(self.status.as_str(),"downloading"|"seeding"){self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"peers":self.peers,"seeders":self.seeders,"pieces":self.pieces,"completed_pieces":self.completed_pieces,"seed_ms":self.seed_ms,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"average_upload_speed":(self.uploaded as u128*1000/self.stats.active_ms.max(1) as u128).min(u64::MAX as u128) as u64,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
+        json!({"id":self.id,"engine":"aria2","kind":self.kind,"name":self.name,"path":display_uri(&self.uri),"status":self.status,"size":self.size,"downloaded":self.downloaded,"speed":if self.status=="downloading"{self.stats.speed_history.last().map_or(0,|p|p.speed)}else{0},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"peak_upload_speed":self.peak_upload_speed,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"connections":self.connections,"peers":self.peers,"seeders":self.seeders,"pieces":self.pieces,"completed_pieces":self.completed_pieces,"seed_ms":self.seed_ms,"group_id":self.group_id,"group_name":self.group_name,"created_at":self.created_at,"error":self.error,"files":self.files,"peak_speed":self.stats.peak_speed,"average_speed":self.stats.average_speed,"active_ms":self.stats.active_ms,"average_upload_speed":(self.uploaded as u128*1000/self.stats.active_ms.max(1) as u128).min(u64::MAX as u128) as u64,"transferred_bytes":self.stats.transferred_bytes,"speed_history":self.stats.speed_history})
     }
 }
 pub struct Transfers {
@@ -99,6 +113,7 @@ pub struct Transfers {
     downloading: AtomicBool,
     pub received_delta: AtomicU64,
     pub sent_delta: AtomicU64,
+    last_saved: AtomicU64,
 }
 fn display_uri(raw: &str) -> String {
     if raw.starts_with("magnet:") {
@@ -179,6 +194,11 @@ impl Transfers {
                 t.status = "paused".into();
             }
             t.upload_speed = 0;
+            if t.seed_only {
+                t.status = "completed".into();
+            }
+            t.seed_check = false;
+            t.seed_only = false;
         }
         fs::create_dir_all(downloads.join("transfers")).await?;
         let data = fs::canonicalize(data).await?;
@@ -203,6 +223,7 @@ impl Transfers {
             downloading: AtomicBool::new(false),
             received_delta: AtomicU64::new(0),
             sent_delta: AtomicU64::new(0),
+            last_saved: AtomicU64::new(now()),
         };
         if std::env::var("TRANSFER_ENGINE").is_ok_and(|s| s == "disabled") {
             return Ok(engine);
@@ -287,7 +308,9 @@ impl Transfers {
         v.get("result").cloned().context("引擎未返回结果")
     }
     pub(crate) async fn persist(&self, tasks: &BTreeMap<Uuid, Transfer>) -> Result<()> {
-        save(&self.path, tasks).await
+        save(&self.path, tasks).await?;
+        self.last_saved.store(now(), Ordering::Relaxed);
+        Ok(())
     }
     pub async fn public(&self) -> Vec<Value> {
         let tasks = self.tasks.lock().await;
@@ -320,14 +343,20 @@ impl Transfers {
         }
         let options = json!({"seed-ratio":ratio.to_string(),"seed-time":minutes.to_string()});
         self.rpc("changeGlobalOption", json!([options])).await?;
-        let tasks = self.tasks.lock().await;
-        for task in tasks
-            .values()
-            .filter(|t| matches!(t.status.as_str(), "downloading" | "seeding" | "paused"))
-        {
+        let mut tasks = self.tasks.lock().await;
+        for task in tasks.values_mut().filter(|t| {
+            matches!(
+                t.status.as_str(),
+                "downloading" | "seeding" | "paused" | "checking"
+            )
+        }) {
+            if task.seed_only {
+                task.seed_policy_ratio = ratio;
+                task.seed_policy_minutes = minutes;
+            }
             let _ = self.rpc("changeOption", json!([task.gid, options])).await;
         }
-        Ok(())
+        self.persist(&tasks).await
     }
     pub async fn poll(&self, elapsed_ms: u64) -> Result<()> {
         if !self.available() {
@@ -335,19 +364,34 @@ impl Transfers {
         }
         let mut tasks = self.tasks.lock().await;
         let mut downloading = false;
+        let mut changed = false;
+        let mut active = false;
         for t in tasks
             .values_mut()
             .filter(|t| !t.hidden && t.status != "completed")
         {
+            let previous = (
+                t.status.clone(),
+                t.gid.clone(),
+                t.files.len(),
+                t.torrent.len(),
+            );
             let Ok(mut v) = self.rpc("tellStatus", json!([t.gid])).await else {
                 continue;
             };
+            if t.seed_only {
+                self.poll_seed(t, &v, elapsed_ms).await;
+                changed |= previous.0 != t.status || previous.1 != t.gid;
+                active |= t.seed_only;
+                continue;
+            }
             if let Some(child) = v["followedBy"]
                 .as_array()
                 .and_then(|a| a.first())
                 .and_then(Value::as_str)
             {
                 let next = child.to_owned();
+                self.cache_torrent(t, &v).await;
                 if let Ok(child_state) = self.rpc("tellStatus", json!([next])).await {
                     t.gid = next;
                     t.kind = "torrent".into();
@@ -357,6 +401,7 @@ impl Transfers {
                     v = child_state;
                 }
             }
+            self.cache_torrent(t, &v).await;
             let status = v["status"].as_str().unwrap_or("paused");
             let total = number(&v, "totalLength");
             let completed = number(&v, "completedLength");
@@ -497,9 +542,26 @@ impl Transfers {
                 }
             }
             downloading |= matches!(t.status.as_str(), "downloading" | "queued" | "metadata");
+            active |= matches!(
+                t.status.as_str(),
+                "downloading" | "queued" | "metadata" | "seeding"
+            );
+            changed |= previous
+                != (
+                    t.status.clone(),
+                    t.gid.clone(),
+                    t.files.len(),
+                    t.torrent.len(),
+                );
         }
         self.downloading.store(downloading, Ordering::Relaxed);
-        self.persist(&tasks).await
+        if changed
+            || elapsed_ms == 0
+            || (active && now().saturating_sub(self.last_saved.load(Ordering::Relaxed)) >= 15)
+        {
+            self.persist(&tasks).await?;
+        }
+        Ok(())
     }
     fn task_dir(&self, task: &Transfer) -> PathBuf {
         task.destination
@@ -665,6 +727,13 @@ async fn create(State(app): State<App>, Json(input): Json<Input>) -> ApiResult<J
         group_id,
         group_name,
         destination: Some(destination),
+        seed_check: false,
+        seed_only: false,
+        seed_forgotten: false,
+        seed_error: None,
+        info_hash: String::new(),
+        seed_policy_ratio: 0.,
+        seed_policy_minutes: 0,
         created_at: now(),
         error: None,
         downloaded: 0,
@@ -720,6 +789,25 @@ async fn list(State(app): State<App>) -> Json<Value> {
     Json(json!(app.0.transfers.public().await))
 }
 async fn pause(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
+    let seed = app
+        .0
+        .transfers
+        .tasks
+        .lock()
+        .await
+        .get(&id)
+        .is_some_and(|t| t.seed_only || (t.bt() && t.status == "seeding"));
+    if seed {
+        return set_seed(
+            State(app),
+            Path(id),
+            Json(SeedInput {
+                enabled: false,
+                forget: false,
+            }),
+        )
+        .await;
+    }
     let mut tasks = app.0.transfers.tasks.lock().await;
     let task = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
     app.0.transfers.rpc("forcePause", json!([task.gid])).await?;
@@ -729,6 +817,25 @@ async fn pause(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<V
     Ok(Json(json!({"ok":true})))
 }
 async fn resume(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
+    let seed = app
+        .0
+        .transfers
+        .tasks
+        .lock()
+        .await
+        .get(&id)
+        .is_some_and(|t| t.bt() && t.seed_ready());
+    if seed {
+        return set_seed(
+            State(app),
+            Path(id),
+            Json(SeedInput {
+                enabled: true,
+                forget: false,
+            }),
+        )
+        .await;
+    }
     let mut tasks = app.0.transfers.tasks.lock().await;
     let task = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
     if task.hidden || task.status == "completed" {
@@ -825,7 +932,7 @@ async fn remove(
     let task = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
     if matches!(
         task.status.as_str(),
-        "downloading" | "queued" | "seeding" | "metadata"
+        "downloading" | "queued" | "seeding" | "metadata" | "checking"
     ) {
         return Err(bad("请先暂停下载或做种，再移除任务"));
     }
@@ -877,7 +984,10 @@ async fn file(
         .ok_or_else(|| bad("文件不存在"))?;
     if f.local_deleted
         || f.completed != f.length
-        || !matches!(task.status.as_str(), "completed" | "seeding" | "paused")
+        || !matches!(
+            task.status.as_str(),
+            "completed" | "seeding" | "paused" | "checking"
+        )
     {
         return Err(bad("文件仍在下载或校验中"));
     }
@@ -914,7 +1024,10 @@ async fn files(State(app): State<App>) -> Json<Value> {
         for f in &t.files {
             if !f.local_deleted
                 && f.completed == f.length
-                && matches!(t.status.as_str(), "completed" | "seeding" | "paused")
+                && matches!(
+                    t.status.as_str(),
+                    "completed" | "seeding" | "paused" | "checking"
+                )
             {
                 files.push(json!({"id":t.id,"index":f.index,"name":f.name,"size":f.length,"seeding":t.status=="seeding","url":format!("/api/transfers/{}/files/{}",t.id,f.index)}));
             }
@@ -929,6 +1042,8 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/transfers", get(list).post(create))
         .route("/transfers/status", get(status))
+        .route("/seeding", get(seeding))
+        .route("/transfers/{id}/seed", post(set_seed))
         .route("/transfers/files", get(files))
         .route("/transfers/{id}", axum::routing::delete(remove))
         .route("/transfers/{id}/select", post(select))
@@ -936,4 +1051,337 @@ pub fn routes() -> Router<App> {
         .route("/transfers/{id}/resume", post(resume))
         .route("/transfers/{id}/files/{index}", get(file))
         .layer(DefaultBodyLimit::max(12 * 1024 * 1024))
+}
+
+impl Transfer {
+    pub(crate) fn seed_linked(&self) -> bool {
+        self.bt() && !self.seed_forgotten
+    }
+    pub(crate) fn bt(&self) -> bool {
+        matches!(self.kind.as_str(), "torrent" | "magnet")
+    }
+    fn seed_ready(&self) -> bool {
+        let files: Vec<_> = self.files.iter().filter(|f| f.selected).collect();
+        !files.is_empty()
+            && files
+                .iter()
+                .all(|f| !f.local_deleted && f.completed == f.length)
+    }
+    pub(crate) fn seed_summary(&self) -> Value {
+        let enabled = self.seed_only || self.status == "seeding";
+        let ready = self.seed_ready();
+        json!({"id":self.id,"name":self.name,"status":self.status,"enabled":enabled,"checking":self.seed_check,"can_start":ready&&!enabled&&!self.seed_forgotten,"reason":if self.seed_forgotten{"种子关联已移除"}else if !ready{"选中的文件尚未下载完成或已经删除"}else{""},"upload_speed":self.upload_speed,"uploaded":self.uploaded,"share_ratio":if self.downloaded>0{self.uploaded as f64/self.downloaded as f64}else{0.},"peers":self.peers,"seed_ms":self.seed_ms,"files":self.files.iter().filter(|f|f.selected).count(),"error":self.seed_error})
+    }
+}
+impl Transfers {
+    async fn cache_torrent(&self, t: &mut Transfer, v: &Value) {
+        if !t.torrent.is_empty() || t.seed_forgotten {
+            return;
+        }
+        if let Some(hash) = v["infoHash"]
+            .as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            t.info_hash = hash.to_ascii_lowercase();
+        }
+        if !t.bt() && t.info_hash.is_empty() && !v["followedBy"].is_array() {
+            return;
+        }
+        if t.info_hash.is_empty()
+            && let Ok(url) = Url::parse(&t.uri)
+        {
+            for (key, value) in url.query_pairs() {
+                if key == "xt"
+                    && let Some(hash) = value
+                        .strip_prefix("urn:btih:")
+                        .filter(|h| h.len() == 40 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+                {
+                    t.info_hash = hash.to_ascii_lowercase();
+                }
+            }
+        }
+        let mut candidates = vec![];
+        let root = self.downloads.parent().unwrap();
+        let directory = self.task_dir(t);
+        if !t.info_hash.is_empty() {
+            candidates.push(directory.join(format!("{}.torrent", t.info_hash)));
+        }
+        candidates.push(directory.join(&t.name));
+        if let Ok(url) = Url::parse(&t.uri)
+            && let Some(name) = url.path_segments().and_then(|mut p| p.next_back())
+        {
+            candidates.push(directory.join(safe_name(name)));
+        }
+        for path in candidates {
+            let Ok(relative) = crate::local::relative(root, &path) else {
+                continue;
+            };
+            if crate::local::checked_path(root, &relative, false)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(meta) = fs::symlink_metadata(&path).await
+                && meta.is_file()
+                && meta.len() <= 8 * 1024 * 1024
+                && let Ok(raw) = fs::read(path).await
+                && raw.first() == Some(&b'd')
+            {
+                use base64::Engine;
+                t.torrent = base64::engine::general_purpose::STANDARD.encode(raw);
+                break;
+            }
+        }
+    }
+    async fn seed_files(&self, t: &Transfer) -> Result<Vec<String>> {
+        let root = self.downloads.parent().context("下载根目录无效")?;
+        let mut paths = vec![];
+        for f in t.files.iter().filter(|f| f.selected) {
+            ensure!(
+                !f.local_deleted && f.completed == f.length,
+                "选中的文件尚未完成或已经删除"
+            );
+            let path = f
+                .local_path
+                .as_ref()
+                .map(|p| root.join(p))
+                .unwrap_or_else(|| self.task_dir(t).join(&f.name));
+            let relative = crate::local::relative(root, &path)?;
+            crate::local::checked_path(root, &relative, false).await?;
+            let meta = fs::symlink_metadata(path).await?;
+            ensure!(
+                meta.is_file() && meta.len() == f.length,
+                "本地文件缺失或大小已经变化，未启动做种"
+            );
+            paths.push(format!("{}={relative}", f.index));
+        }
+        ensure!(!paths.is_empty(), "请先选择并完成下载");
+        Ok(paths)
+    }
+    async fn add_seed(&self, t: &Transfer, checking: bool) -> Result<()> {
+        ensure!(!t.torrent.is_empty(), "缺少种子元数据，请重新导入原种子");
+        let root = self.downloads.parent().context("下载根目录无效")?;
+        ensure!(t.seed_policy_minutes > 0, "当前做种策略已停止上传");
+        let paths = self.seed_files(t).await?;
+        let selected = t
+            .files
+            .iter()
+            .filter(|f| f.selected)
+            .map(|f| f.index.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let options = json!({"gid":t.gid,"dir":root.to_string_lossy(),"index-out":paths,"select-file":selected,"pause":if checking{"true"}else{"false"},"file-allocation":"none","allow-overwrite":"false","auto-file-renaming":"false","check-integrity":if checking{"true"}else{"false"},"hash-check-only":if checking{"true"}else{"false"},"bt-seed-unverified":if checking{"false"}else{"true"},"bt-hash-check-seed":"true","bt-save-metadata":"false","follow-torrent":"false","seed-ratio":if checking{"0".to_string()}else{t.seed_policy_ratio.to_string()},"seed-time":if checking{"0".to_string()}else{t.seed_policy_minutes.to_string()}});
+        self.rpc("addTorrent", json!([t.torrent, [], options]))
+            .await?;
+        if checking {
+            let state = self.rpc("tellStatus", json!([t.gid])).await?;
+            let matches = state["files"].as_array().is_some_and(|files| {
+                t.files.iter().filter(|f| f.selected).all(|f| {
+                    files.iter().any(|actual| {
+                        number(actual, "index") == f.index
+                            && number(actual, "length") == f.length
+                            && actual["path"].as_str().is_some_and(|p| {
+                                FsPath::new(p)
+                                    == f.local_path
+                                        .as_ref()
+                                        .map(|p| root.join(p))
+                                        .unwrap_or_else(|| self.task_dir(t).join(&f.name))
+                            })
+                    })
+                })
+            });
+            if !matches {
+                let _ = self.rpc("forceRemove", json!([t.gid])).await;
+                let _ = self.rpc("removeDownloadResult", json!([t.gid])).await;
+                bail!("种子元数据与本地文件不匹配，未启动校验或修改文件");
+            }
+            self.rpc("unpause", json!([t.gid])).await?;
+        }
+        Ok(())
+    }
+    async fn release_seed(&self, t: &Transfer) -> Result<()> {
+        // A missing GID is safe only when the RPC engine itself is still reachable.
+        self.rpc("getGlobalStat", json!([])).await?;
+        if let Ok(v) = self.rpc("tellStatus", json!([t.gid])).await {
+            if matches!(v["status"].as_str(), Some("active" | "waiting")) {
+                self.rpc("forcePause", json!([t.gid])).await?;
+                let mut stopped = false;
+                for _ in 0..40 {
+                    let v = self.rpc("tellStatus", json!([t.gid])).await?;
+                    if matches!(
+                        v["status"].as_str(),
+                        Some("paused" | "complete" | "error" | "removed")
+                    ) {
+                        stopped = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                ensure!(stopped, "做种尚未停止，请稍后重试");
+            }
+            let _ = self.rpc("forceRemove", json!([t.gid])).await;
+            let _ = self.rpc("removeDownloadResult", json!([t.gid])).await;
+        }
+        Ok(())
+    }
+    async fn poll_seed(&self, t: &mut Transfer, v: &Value, elapsed: u64) {
+        let state = v["status"].as_str().unwrap_or("error");
+        if t.seed_check {
+            if matches!(state, "active" | "waiting" | "paused") {
+                t.status = if state == "paused" {
+                    "paused"
+                } else {
+                    "checking"
+                }
+                .into();
+                return;
+            }
+            let checked = v["files"].as_array().is_some_and(|files| {
+                t.files.iter().filter(|f| f.selected).all(|f| {
+                    files.iter().any(|actual| {
+                        number(actual, "index") == f.index
+                            && number(actual, "length") == f.length
+                            && number(actual, "completedLength") == f.length
+                    })
+                })
+            });
+            if state == "complete" && checked {
+                let _ = self.rpc("removeDownloadResult", json!([t.gid])).await;
+                t.gid = Uuid::new_v4().simple().to_string()[..16].into();
+                t.seed_check = false;
+                t.last_sent = 0;
+                match self.add_seed(t, false).await {
+                    Ok(()) => {
+                        t.status = "seeding".into();
+                        t.seed_error = None;
+                        return;
+                    }
+                    Err(_) => {
+                        t.seed_error =
+                            Some("文件已保留，但做种启动失败，请检查引擎或文件后重试".into())
+                    }
+                }
+            } else {
+                t.seed_error = Some("种子校验未通过，已停止；没有重新下载或覆盖本地文件".into());
+            }
+            t.seed_check = false;
+            t.seed_only = false;
+            t.status = "completed".into();
+            t.upload_speed = 0;
+            return;
+        }
+        let sent = number(v, "uploadLength");
+        let delta = if sent >= t.last_sent {
+            sent - t.last_sent
+        } else {
+            sent
+        };
+        t.uploaded = t.uploaded.saturating_add(delta);
+        t.last_sent = sent;
+        self.sent_delta.fetch_add(delta, Ordering::Relaxed);
+        t.upload_speed = number(v, "uploadSpeed");
+        t.peak_upload_speed = t.peak_upload_speed.max(t.upload_speed);
+        t.peers = number(v, "connections");
+        t.seeders = number(v, "numSeeders");
+        if state == "active" {
+            t.status = "seeding".into();
+            t.seed_ms = t.seed_ms.saturating_add(elapsed);
+        } else if state == "waiting" {
+            t.status = "queued".into();
+        } else if state == "paused" {
+            t.status = "paused".into();
+            t.upload_speed = 0;
+        } else {
+            t.status = "completed".into();
+            t.seed_only = false;
+            t.upload_speed = 0;
+            if state == "error" {
+                t.seed_error = Some("做种引擎已停止，本地文件保留".into());
+            }
+        }
+    }
+}
+#[derive(Deserialize)]
+struct SeedInput {
+    enabled: bool,
+    #[serde(default)]
+    forget: bool,
+}
+async fn seeding(State(app): State<App>) -> Json<Value> {
+    let tasks = app.0.transfers.tasks.lock().await;
+    Json(json!(
+        tasks
+            .values()
+            .filter(|t| t.bt() && !t.seed_forgotten)
+            .map(Transfer::seed_summary)
+            .collect::<Vec<_>>()
+    ))
+}
+async fn set_seed(
+    State(app): State<App>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<SeedInput>,
+) -> ApiResult<Json<Value>> {
+    let _guard = app.0.control.file_lock.lock().await;
+    let mut tasks = app.0.transfers.tasks.lock().await;
+    let t = tasks.get_mut(&id).ok_or_else(|| bad("任务不存在"))?;
+    if !t.bt() || t.seed_forgotten {
+        return Err(bad("该文件没有可用的 BT 种子关联"));
+    }
+    if !t.seed_ready() {
+        return Err(bad("请先下载完成选中的文件；未完成任务请在下载任务页暂停"));
+    }
+    if input.enabled && input.forget {
+        return Err(bad("不能同时开始做种和移除关联"));
+    }
+    if !app.0.transfers.available() {
+        return Err(bad("做种引擎不可用"));
+    }
+    if input.enabled {
+        if t.seed_only || t.status == "seeding" {
+            return Ok(Json(t.seed_summary()));
+        }
+        let value = app
+            .0
+            .transfers
+            .rpc("tellStatus", json!([t.gid]))
+            .await
+            .unwrap_or(Value::Null);
+        app.0.transfers.cache_torrent(t, &value).await;
+        if t.torrent.is_empty() {
+            return Err(bad("缺少种子元数据，请重新导入原种子；本地文件未修改"));
+        }
+        app.0.transfers.seed_files(t).await?;
+        let settings = app.0.bandwidth.settings.lock().await.clone();
+        if settings.seed_minutes == 0 {
+            return Err(bad("做种时长目前为 0，请先在首页带宽策略中设置做种时长"));
+        }
+        app.0.transfers.release_seed(t).await?;
+        t.seed_policy_ratio = settings.seed_ratio;
+        t.seed_policy_minutes = settings.seed_minutes;
+        t.gid = Uuid::new_v4().simple().to_string()[..16].into();
+        app.0.transfers.add_seed(t, true).await?;
+        t.seed_only = true;
+        t.seed_check = true;
+        t.seed_error = None;
+        t.hidden = false;
+        t.status = "checking".into();
+        t.last_sent = 0;
+    } else {
+        app.0.transfers.release_seed(t).await?;
+        t.seed_only = false;
+        t.seed_check = false;
+        t.status = "completed".into();
+        t.upload_speed = 0;
+        if input.forget {
+            t.seed_forgotten = true;
+            t.torrent.clear();
+            t.info_hash.clear();
+            t.seed_error = None;
+        }
+    }
+    let result = t.seed_summary();
+    app.0.transfers.persist(&tasks).await?;
+    Ok(Json(result))
 }

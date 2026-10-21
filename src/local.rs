@@ -278,7 +278,12 @@ async fn tree(State(app): State<App>, Query(q): Query<Location>) -> ApiResult<Js
         let locked = busy.iter().any(|p| overlaps(&relative, p));
         let transfer = tasks
             .values()
-            .filter(|t| matches!(t.status.as_str(), "completed" | "paused" | "seeding"))
+            .filter(|t| {
+                matches!(
+                    t.status.as_str(),
+                    "completed" | "paused" | "seeding" | "checking"
+                )
+            })
             .find_map(|t| {
                 t.files
                     .iter()
@@ -293,9 +298,26 @@ async fn tree(State(app): State<App>, Query(q): Query<Location>) -> ApiResult<Js
         if kind.is_file() && locked && transfer.is_none() {
             continue;
         }
+        let seeds: Vec<_> = tasks
+            .values()
+            .filter(|t| t.seed_linked())
+            .filter(|t| {
+                t.files.iter().any(|f| {
+                    !f.local_deleted && f.selected && {
+                        let file = transfer_file(&app, t, f);
+                        if kind.is_dir() {
+                            file.starts_with(entry.path())
+                        } else {
+                            file == entry.path()
+                        }
+                    }
+                })
+            })
+            .map(|t| t.seed_summary())
+            .collect();
         let meta = entry.metadata().await?;
         let job = jobs.values().find(|j| job_file(&app, j) == entry.path());
-        entries.push(json!({"path":format!("/{relative}"),"name":name,"is_dir":kind.is_dir(),"size":if kind.is_file(){Some(meta.len())}else{None},"locked":locked,"download_url":transfer.map(|(id,index)|format!("/api/transfers/{id}/files/{index}")),"sha256":job.and_then(|j|j.sha256.clone()),"passwords":job.map(|j|j.passwords.clone()).unwrap_or_default(),"modified":meta.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d|d.as_secs())}));
+        entries.push(json!({"path":format!("/{relative}"),"name":name,"is_dir":kind.is_dir(),"size":if kind.is_file(){Some(meta.len())}else{None},"locked":locked,"seeding":seeds,"download_url":transfer.map(|(id,index)|format!("/api/transfers/{id}/files/{index}")),"sha256":job.and_then(|j|j.sha256.clone()),"passwords":job.map(|j|j.passwords.clone()).unwrap_or_default(),"modified":meta.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d|d.as_secs())}));
     }
     entries.sort_by_key(|e| {
         (

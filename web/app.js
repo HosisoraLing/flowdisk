@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let currentPath = '/', page = 1, total = 0, entries = [], roots = [], selected = new Set(), view = 'browse', timer, busy = false;
 let toastTimer, accounts = [], loginSession = null, loginPoll, loginChecking = false, loginRevision = 0, pollCount = 0;
-const labels = {queued:'等待下载',downloading:'正在下载',pausing:'正在暂停',paused:'已暂停',failed:'下载失败',completed:'已完成',seeding:'正在做种',metadata:'读取种子信息',selecting:'等待选择文件'};
+const labels = {queued:'等待下载',downloading:'正在下载',pausing:'正在暂停',paused:'已暂停',failed:'下载失败',completed:'已完成',seeding:'正在做种',metadata:'读取种子信息',selecting:'等待选择文件',checking:'校验做种文件'};
 function text(tag, value, cls) { const el = document.createElement(tag); el.textContent = value; if(cls) el.className = cls; return el; }
 function button(label, action, cls) { const el = text('button', label, cls); el.type = 'button'; el.onclick = action; return el; }
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 5000); }
@@ -23,7 +23,7 @@ async function initialize() {
     $('thread-setting').textContent = `每文件最多 ${status.threads} 连接`;
     if(!status.gateway_connected) toast(status.gateway_error || '请先配置 OpenList 网盘');
     await loadAccounts(); await loadSmb(); await loadRoots(); await browse('/',1); await loadJobs(); await loadShares(); if(typeof loadTools==='function')await loadTools();
-    clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(view==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(()=>{}); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
+    clearInterval(timer); timer = setInterval(() => { loadJobs().catch(e => toast(e.message)); if(view==='local'&&typeof loadSeeding==='function')loadSeeding().catch(()=>{}); if(view==='statistics'&&typeof loadStatistics==='function')loadStatistics().catch(()=>{}); if(++pollCount % 3 === 0) loadShares().catch(()=>{}); },1500);
   } catch(e) { if(!$('workspace').hidden) toast(e.message); else { loginView(); $('login-error').textContent = e.message === '请先登录' ? '' : e.message; } }
 }
 $('login-form').onsubmit = async event => {
