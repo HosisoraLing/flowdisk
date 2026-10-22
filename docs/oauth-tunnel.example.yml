@@ -1,0 +1,8 @@
+# Create a dedicated named tunnel; do not reuse a connector serving other apps.
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /data/oauth-tunnel/credentials.json
+ingress:
+  - hostname: auth.example.com
+    path: ^/oauth/((google|onedrive)/callback|complete[.]js)$
+    service: http://127.0.0.1:8080
+  - service: http_status:404

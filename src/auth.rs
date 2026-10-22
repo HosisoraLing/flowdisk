@@ -25,6 +25,7 @@ pub struct Auth {
     sessions: Mutex<BTreeMap<Uuid, Session>>,
     credentials: Mutex<BTreeMap<String, Value>>,
     oauth_clients: Mutex<BTreeMap<String, crate::external::OAuthConfig>>,
+    tunnel: crate::oauth_tunnel::OAuthTunnel,
 }
 struct Session {
     id: Uuid,
@@ -176,6 +177,7 @@ impl Auth {
             sessions: Mutex::new(BTreeMap::new()),
             credentials: Mutex::new(BTreeMap::new()),
             oauth_clients: Mutex::new(BTreeMap::new()),
+            tunnel: crate::oauth_tunnel::OAuthTunnel::new(),
         })
     }
     pub fn with_data(data: &std::path::Path) -> Result<Self> {
@@ -262,7 +264,13 @@ impl Auth {
             let id = Uuid::parse_str(parts[1]).map_err(|_| bad("登录会话无效"))?;
             let mut all = self.sessions.lock().await;
             if method == Method::DELETE {
-                all.remove(&id);
+                if let Some(removed) = all.remove(&id) {
+                    if removed.status == "ready" {
+                        self.tunnel.finish(id);
+                    } else {
+                        self.tunnel.cancel(id).await;
+                    }
+                }
                 return Ok(json!({"ok":true}));
             }
             let s = all
@@ -273,6 +281,7 @@ impl Auth {
                 s.private = json!({});
                 s.cookies.clear();
                 s.status = "expired".into();
+                self.tunnel.cancel(id).await;
                 s.message = "登录已过期，请重新开始".into();
                 return Ok(s.view());
             }
@@ -290,7 +299,16 @@ impl Auth {
             let key = parts[1];
             if method == Method::DELETE {
                 self.credentials.lock().await.remove(key);
-                self.sessions.lock().await.retain(|_, s| s.provider != key);
+                let mut sessions = self.sessions.lock().await;
+                let ids: Vec<_> = sessions
+                    .values()
+                    .filter(|s| s.provider == key)
+                    .map(|s| s.id)
+                    .collect();
+                sessions.retain(|_, s| s.provider != key);
+                for id in ids {
+                    self.tunnel.cancel(id).await;
+                }
                 return Ok(json!({"ok":true}));
             }
             if parts.get(2) == Some(&"credentials") {
@@ -530,6 +548,8 @@ impl Auth {
                             .append_pair("prompt", "consent");
                     }
                     s.public["authorize_url"] = u.to_string().into();
+                    self.tunnel.acquire(s.id, s.expires).await?;
+                    s.public["temporary_tunnel"] = self.tunnel.enabled().into();
                     s.message = "在网盘官方页面登录并授权，完成后工作台会自动连接".into();
                 } else {
                     s.public["setup_required"] = true.into();
@@ -555,6 +575,7 @@ impl Auth {
         let mut all = self.sessions.lock().await;
         all.retain(|_, s| s.expires > now());
         if all.len() >= 16 {
+            self.tunnel.cancel(s.id).await;
             return Err(bad("登录会话过多，请关闭旧会话后重试"));
         }
         all.insert(s.id, s);
@@ -1543,7 +1564,31 @@ pub async fn external_callback(
         s.message = "授权成功，等待网盘连接".into();
         Ok(())
     }
-    match complete(&app, &provider, q).await {
+    let id = q.state;
+    let valid = app
+        .0
+        .control
+        .auth_sessions()
+        .await
+        .get(&id)
+        .is_some_and(|s| {
+            s.provider == provider
+                && s.mode == "oauth"
+                && s.status == "waiting"
+                && s.expires > now()
+        });
+    let result = complete(&app, &provider, q).await;
+    if valid {
+        if let Err(error) = &result
+            && let Some(s) = app.0.control.auth_sessions().await.get_mut(&id)
+            && s.status == "waiting"
+        {
+            s.status = "failed".into();
+            s.message = error.1.clone();
+        }
+        app.0.control.native_auth().tunnel.finish(id);
+    }
+    match result {
         Ok(()) => Html("<!doctype html><meta charset=utf-8><title>授权完成</title><script src=/oauth/complete.js defer></script><p>授权已完成，工作台将自动连接。此窗口会自动关闭。</p><a href=/>返回工作台</a>").into_response(),
         Err(e) => e.into_response(),
     }

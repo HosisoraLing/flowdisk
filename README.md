@@ -82,7 +82,7 @@ ssh -L 8080:127.0.0.1:8080 -L 5244:127.0.0.1:5244 user@server
 
 OneDrive 默认使用官方设备码：在工作台填写一次微软应用客户端 ID，应用后台启用“允许公共客户端流”，并选择支持所需个人 / 组织账号的类型。点击“设备码登录”，在微软官方窗口输入工作台显示的短码并授权，工作台自动连接。服务器只需能访问微软，不需要公网 IP、域名、回调地址、端口映射或客户端密钥。组织管理员仍可能禁止设备码或限制应用授权。Rust 直接向微软刷新授权，网关通过受密钥保护的下载器内部接口刷新，不依赖 OpenList 公网授权助手；标准 Compose 已配置容器互访，非标准网络可用 `FLOWDISK_INTERNAL_URL` 指定网关可访问的下载器内部地址。
 
-Google Drive 的网页授权及可选的 OneDrive 网页授权，在工作台填写客户端 ID、密钥和工作台 HTTPS 地址，并在官方应用后台登记表单显示的回调地址。授权成功后工作台自动连接，无需跳转 OpenList 授权助手或复制刷新令牌。保存后立即生效，重启后仍保留；配置只保存在服务器数据目录的 `oauth-clients.json`，密钥不会回显到网页。不要把这个文件提交到 Git。
+Google Drive 的网页授权及可选的 OneDrive 网页授权，在工作台填写客户端 ID、密钥和授权回调 HTTPS 地址，并在官方应用后台登记表单显示的回调地址。授权成功后工作台自动连接，无需跳转 OpenList 授权助手或复制刷新令牌。工作台本身可以继续使用内网地址。保存后立即生效，重启后仍保留；配置只保存在服务器数据目录的 `oauth-clients.json`，密钥不会回显到网页。不要把这个文件提交到 Git。
 
 Google 的网页授权回调需要 HTTPS 域名，不能直接使用局域网 IP；本机 localhost 可用于测试。应用权限及同意屏幕仍需在官方后台完成配置。已有令牌导入保留为兼容入口，默认使用自己的应用；旧 OpenList 令牌可手动选择兼容来源。百度通常直接扫码即可。
 
@@ -99,6 +99,17 @@ Google 的网页授权回调需要 HTTPS 域名，不能直接使用局域网 IP
 OneDrive 目前接入国际版。Google 原生在线文档和快捷方式需先在官方页面导出为普通文件。组织策略、分享权限和官方安全验证仍适用。
 
 如果部署网络需要代理，在 `.env` 设置 `CLOUD_HTTPS_PROXY`、可选的 `CLOUD_HTTP_PROXY` 和 `CLOUD_NO_PROXY`。代理地址须能从容器内访问，不能用容器内的 `127.0.0.1` 指代宿主机；默认跳过 OpenList 内网请求。
+
+### 没有公网 IP：仅在授权期间开启隧道
+
+可以使用独立的 Cloudflare 命名隧道，为官方网页登录提供固定 HTTPS 回调域名。无需公网 IP、入站端口映射或付费证书；Cloudflare Universal SSL 会自动签发和续期证书。使用自己已有并接入 Cloudflare 的域名即可，临时 Quick Tunnel 的域名会变化，不适合登记固定回调。
+
+1. 创建一个仅用于 FlowDisk 授权的命名隧道及固定 DNS 记录。不要复用承载其他服务、需要一直运行的隧道。
+2. 将隧道凭据保存到宿主机 `data/flowdisk/oauth-tunnel/credentials.json`。参考 [配置示例](docs/oauth-tunnel.example.yml) 创建同目录的 `config.yml`，填写隧道 ID 和授权子域名。凭据及配置需允许容器运行用户读取，不要提交到 Git。
+3. 在 `.env` 设置 `OAUTH_TUNNEL_CONFIG=/data/oauth-tunnel/config.yml` 和 `PUBLIC_URL=https://auth.example.com`，重建下载器容器。镜像已包含 cloudflared，不需要另起常驻授权隧道容器。
+4. 在 Google / 微软应用后台登记 `https://auth.example.com/oauth/google/callback` 或 `https://auth.example.com/oauth/onedrive/callback`，在工作台填写应用信息后点击官方网页登录。
+
+只有已配置的网页授权开始时才启动连接。成功、取消、超时或关闭登录窗口后停止；多次并行授权会共用连接，最后一个会话结束后关闭。完成页有两秒关闭窗口的收尾时间。平时 DNS 记录保留，但没有活动的授权连接。隧道仅匹配授权回调及完成脚本，其余路径返回 404，工作台、API 和文件下载不经过此入口。OneDrive 设备码登录不启动隧道。
 
 ## 从网盘分享下载
 

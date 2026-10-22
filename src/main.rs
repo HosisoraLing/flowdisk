@@ -9,6 +9,7 @@ mod gateway;
 mod links;
 mod local;
 mod mcp;
+mod oauth_tunnel;
 mod review;
 mod serve_file;
 mod telemetry;
