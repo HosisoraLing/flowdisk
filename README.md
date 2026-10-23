@@ -7,6 +7,7 @@ FlowDisk 是使用 Rust 开发、通过 Docker 部署的聚合下载工具。一
 ## 可以做什么
 
 - **连接网盘与共享**：百度网盘、夸克、115、迅雷云盘、OneDrive、Google Drive，以及多个 SMB 共享。
+- **官方账号登录**：支持短信、扫码及已有授权，具体方式取决于网盘；OneDrive 默认使用无需公网回调的设备码，Google Drive 使用官方网页登录，可通过仅在授权期间连接的 Cloudflare 隧道接收回调。
 - **先看内容再下载**：解析网盘分享链接，浏览目录、查看文件大小、搜索和筛选，预览图片、音频、视频、文本及渲染后的 Markdown，勾选文件或文件夹下载。
 - **管理各种下载**：HTTP、HTTPS、FTP 链接、磁力链接和种子文件统一进入任务列表；也可从静态 HTML 页面提取链接后选择下载。
 - **多连接与续传**：支持 Range 的来源可分段并发下载，暂停、断流或重启后保留进度；成品文件可通过网页下载到自己的设备，并支持 Range 续传。
@@ -57,7 +58,9 @@ docker compose up -d --force-recreate downloader
 ssh -L 8080:127.0.0.1:8080 -L 5244:127.0.0.1:5244 user@server
 ```
 
-使用 HTTPS 反向代理时，配置 `PUBLIC_URL` 为工作台外部地址，并设置 `COOKIE_SECURE=true`。保管好 `.env`、授权数据和访问令牌；同一部署供一个可信用户使用，不提供多用户账号隔离。
+工作台通过 HTTPS 访问时，可设置 `COOKIE_SECURE=true`。如果工作台仍使用内网 HTTP、只有授权回调使用 HTTPS，则保留 `COOKIE_SECURE=false`，避免浏览器无法保存工作台登录状态。`PUBLIC_URL` 用于生成授权回调地址，可以指向独立的授权域名，不必公开工作台。
+
+保管好 `.env`、授权数据和访问令牌；同一部署供一个可信用户使用，不提供多用户账号隔离。
 
 ## 连接网盘
 
@@ -74,27 +77,49 @@ ssh -L 8080:127.0.0.1:8080 -L 5244:127.0.0.1:5244 user@server
 
 夸克短信使用官方表单，需要浏览器可以访问官方验证资源。迅雷短信在工作台填写手机号，点击“获取验证码”后输入短信登录；打开弹窗不会自动发送短信。需要官方安全验证时，按界面提示由本人完成。
 
-百度和 115 当前没有手机验证码入口。115、修正后的迅雷扫码，以及 OneDrive / Google Drive 的真实账号下载仍需本人验证，不能把二维码生成或协议模拟成功当作真实登录完成。
+百度没有独立的手机验证码表单；配置自建 OAuth 应用后，可在百度官方授权页按其提示选择短信或扫码。115 当前没有手机验证码入口。115、迅雷扫码以及 OneDrive / Google Drive 的真实账号下载仍需本人验证。
 
 连接账号、挂载和高级配置也可在 <http://127.0.0.1:5244> 管理，用户名为 `admin`，密码为 `.env` 中的 `OPENLIST_PASSWORD`。更改管理密码后，同步更新 `.env` 并重建下载器容器。退出或更换有活动下载的账号前，需要先暂停相关任务。
 
-### OneDrive、Google Drive 与可选百度 OAuth
+### OneDrive：设备码登录
 
-OneDrive 默认使用官方设备码：在工作台填写一次微软应用客户端 ID，应用后台启用“允许公共客户端流”，并选择支持所需个人 / 组织账号的类型。点击“设备码登录”，在微软官方窗口输入工作台显示的短码并授权，工作台自动连接。服务器只需能访问微软，不需要公网 IP、域名、回调地址、端口映射或客户端密钥。组织管理员仍可能禁止设备码或限制应用授权。Rust 直接向微软刷新授权，网关通过受密钥保护的下载器内部接口刷新，不依赖 OpenList 公网授权助手；标准 Compose 已配置容器互访，非标准网络可用 `FLOWDISK_INTERNAL_URL` 指定网关可访问的下载器内部地址。
+首次使用需要自行注册微软应用；FlowDisk 不附带预配置的微软或 Google 应用凭据。
 
-Google Drive 的网页授权及可选的 OneDrive 网页授权，在工作台填写客户端 ID、密钥和授权回调 HTTPS 地址，并在官方应用后台登记表单显示的回调地址。授权成功后工作台自动连接，无需跳转 OpenList 授权助手或复制刷新令牌。工作台本身可以继续使用内网地址。保存后立即生效，重启后仍保留；配置只保存在服务器数据目录的 `oauth-clients.json`，密钥不会回显到网页。不要把这个文件提交到 Git。
+1. 在微软应用后台选择支持所需个人 / 组织账号的类型，启用“允许公共客户端流”，添加 Microsoft Graph 委托权限 `Files.ReadWrite.All` 和 `offline_access`。
+2. 打开“网盘账号 → OneDrive → 设备码登录”，在应用配置中填写客户端 ID，保存。
+3. 打开工作台给出的微软官方登录页，输入显示的短码，登录并允许授权。
+4. 返回工作台等待自动连接，即可浏览文件和提交下载。
 
-Google 的网页授权回调需要 HTTPS 域名，不能直接使用局域网 IP；本机 localhost 可用于测试。应用权限及同意屏幕仍需在官方后台完成配置。已有令牌导入保留为兼容入口，默认使用自己的应用；旧 OpenList 令牌可手动选择兼容来源。百度通常直接扫码即可。
+[设备码登录](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code)不需要公网 IP、域名、回调地址、端口映射或客户端密钥。FlowDisk 部署在 Linux 服务端时，也可在另一台电脑或 Android 设备上完成官方登录。组织管理员仍可能禁止设备码或限制应用授权。
 
-也可在 `.env` 设置 `PUBLIC_URL` 和对应的客户端配置，并在应用后台登记回调地址。工作台中保存的配置优先于环境变量：
+### Google Drive：官方网页登录
+
+1. 在 Google 应用后台启用 Drive API，配置同意屏幕；处于测试状态时，将自己的账号加入测试用户。
+2. 创建类型为“Web 应用”的 OAuth 客户端，配置 `https://www.googleapis.com/auth/drive` 权限，取得客户端 ID 和密钥。
+3. 打开“网盘账号 → Google Drive → 官方网页登录”，填写客户端 ID、密钥和授权回调 HTTPS 地址，例如 `https://auth.example.com`。
+4. 将表单显示的完整回调地址 `https://auth.example.com/oauth/google/callback` 登记到 Google 应用后台的“已获授权的重定向 URI”，两处必须一致。
+5. 保存配置，点击官方授权页链接，登录并允许授权。工作台会自动连接，无需跳转 OpenList 授权助手或手动复制刷新令牌。
+
+[Google 网页授权](https://developers.google.com/identity/protocols/oauth2/web-server)需要可访问的 HTTPS 回调域名，不能直接使用局域网 IP；本机 localhost 可用于测试。工作台本身可继续使用内网地址，没有公网 IP 时可按下文配置按需隧道。
+
+OneDrive 也可切换“官方网页登录”，填写对应应用的客户端 ID、密钥及回调 HTTPS 地址，并登记表单显示的 `/oauth/onedrive/callback` 回调。设备码登录不需要这些网页回调配置。
+
+在工作台保存应用配置后立即生效，重启后仍保留。配置保存在服务器数据目录的 `oauth-clients.json`，密钥不回显；不要提交到 Git。使用同一客户端时，密钥留空会保留已保存的值；更换客户端时需重新填写对应密钥。已有令牌导入默认使用自己的应用，只有兼容旧 OpenList 令牌时才手动选择相应来源。
+
+### 环境变量与可选百度 OAuth
+
+也可通过 `.env` 提供应用配置，修改后执行 `docker compose up -d downloader` 应用。工作台中保存的配置优先于环境变量：
 
 | 网盘 | 环境变量 | 回调地址 |
 | --- | --- | --- |
 | 百度 | `BAIDU_CLIENT_ID`、`BAIDU_CLIENT_SECRET` | `PUBLIC_URL/oauth/baidu/callback` |
-| OneDrive | `ONEDRIVE_CLIENT_ID`、`ONEDRIVE_CLIENT_SECRET` | `PUBLIC_URL/oauth/onedrive/callback` |
+| OneDrive 设备码 | `ONEDRIVE_CLIENT_ID` | 不需要 |
+| OneDrive 网页授权 | `ONEDRIVE_CLIENT_ID`、`ONEDRIVE_CLIENT_SECRET` | `PUBLIC_URL/oauth/onedrive/callback` |
 | Google Drive | `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET` | `PUBLIC_URL/oauth/google/callback` |
 
-这里的 `PUBLIC_URL` 替换为工作台实际外部地址。Microsoft 应用授权 `Files.ReadWrite.All` 和 `offline_access`；Google 应用启用 Drive API，配置同意屏幕、测试用户及 `https://www.googleapis.com/auth/drive` 权限；百度应用需开通网盘权限。配置后重建下载器容器。
+`PUBLIC_URL` 填写授权回调的外部地址，例如 `https://auth.example.com`，不是带 `/oauth/.../callback` 的完整路径。百度通常直接扫码即可；使用自建 OAuth 时，应用需开通网盘权限。
+
+标准 Compose 已配置网关与下载器之间的授权刷新连接。自定义容器网络时，可用 `FLOWDISK_INTERNAL_URL` 指定网关可访问的下载器内部地址，默认 `http://downloader:8080`；不要将其改为仅转发回调的公网域名。
 
 OneDrive 目前接入国际版。Google 原生在线文档和快捷方式需先在官方页面导出为普通文件。组织策略、分享权限和官方安全验证仍适用。
 
@@ -102,14 +127,22 @@ OneDrive 目前接入国际版。Google 原生在线文档和快捷方式需先�
 
 ### 没有公网 IP：仅在授权期间开启隧道
 
-可以使用独立的 Cloudflare 命名隧道，为官方网页登录提供固定 HTTPS 回调域名。无需公网 IP、入站端口映射或付费证书；Cloudflare Universal SSL 会自动签发和续期证书。使用自己已有并接入 Cloudflare 的域名即可，临时 Quick Tunnel 的域名会变化，不适合登记固定回调。
+可以使用独立的 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/)，为官方网页登录提供固定 HTTPS 回调域名。无需公网 IP、入站端口映射或付费证书；[Cloudflare Universal SSL](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/) 会自动签发和续期证书。使用自己已有并接入 Cloudflare 的域名即可，临时 Quick Tunnel 的域名会变化，不适合登记固定回调。
 
-1. 创建一个仅用于 FlowDisk 授权的命名隧道及固定 DNS 记录。不要复用承载其他服务、需要一直运行的隧道。
+1. 创建一个仅用于 FlowDisk 授权、使用本地配置文件的命名隧道，将固定授权子域名的 DNS 记录指向该隧道。不要复用承载其他服务、需要一直运行的隧道。
 2. 将隧道凭据保存到宿主机 `data/flowdisk/oauth-tunnel/credentials.json`。参考 [配置示例](docs/oauth-tunnel.example.yml) 创建同目录的 `config.yml`，填写隧道 ID 和授权子域名。凭据及配置需允许容器运行用户读取，不要提交到 Git。
-3. 在 `.env` 设置 `OAUTH_TUNNEL_CONFIG=/data/oauth-tunnel/config.yml` 和 `PUBLIC_URL=https://auth.example.com`，重建下载器容器。镜像已包含 cloudflared，不需要另起常驻授权隧道容器。
+3. 在 `.env` 中添加以下配置，执行 `docker compose up -d downloader` 应用。镜像已包含 cloudflared，不需要另起常驻授权隧道容器。
+
+   ```dotenv
+   OAUTH_TUNNEL_CONFIG=/data/oauth-tunnel/config.yml
+   PUBLIC_URL=https://auth.example.com
+   ```
+
 4. 在 Google / 微软应用后台登记 `https://auth.example.com/oauth/google/callback` 或 `https://auth.example.com/oauth/onedrive/callback`，在工作台填写应用信息后点击官方网页登录。
 
-只有已配置的网页授权开始时才启动连接。成功、取消、超时或关闭登录窗口后停止；多次并行授权会共用连接，最后一个会话结束后关闭。完成页有两秒关闭窗口的收尾时间。平时 DNS 记录保留，但没有活动的授权连接。隧道仅匹配授权回调及完成脚本，其余路径返回 404，工作台、API 和文件下载不经过此入口。OneDrive 设备码登录不启动隧道。
+连接只在已配置的 Google / OneDrive 网页授权开始时启动。收到授权结果、在工作台取消或关闭登录弹窗、会话超时后停止；完成回调保留约两秒关闭窗口的收尾时间。多次并行授权共用连接，最后一个会话结束后关闭。取消登录时应关闭工作台的登录弹窗；只关闭官方登录标签页不会立即结束工作台中的会话。
+
+连接期间仅转发 `/oauth/google/callback`、`/oauth/onedrive/callback` 和 `/oauth/complete.js`，其他路径返回 404，工作台、API 和文件下载不经过此入口。空闲时 DNS 记录保留，但没有活动的授权连接，此时直接访问授权域名可能看到 Cloudflare 的离线提示。OneDrive 设备码登录不启动隧道；此配置示例不包含百度回调。
 
 ## 从网盘分享下载
 
