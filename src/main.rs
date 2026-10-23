@@ -6,6 +6,7 @@ mod download;
 mod external;
 mod files;
 mod gateway;
+mod github;
 mod links;
 mod local;
 mod mcp;
@@ -732,6 +733,7 @@ async fn main() -> Result<()> {
         .merge(review::routes())
         .merge(transfers::routes())
         .merge(links::routes())
+        .merge(github::routes())
         .merge(bandwidth::routes())
         .merge(telemetry::routes())
         .route("/status", get(status))

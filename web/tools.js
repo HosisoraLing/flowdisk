@@ -5,10 +5,20 @@ function downloadInputs(raw){
   const urls=raw.match(/(?:magnet:\?|(?:https?|ftp|sftp):\/\/)[^\s<>"，。；）】]+/gi)||[];
   if(!urls.length)throw Error('请粘贴下载链接或磁力链接，也可拖入 .torrent 文件');
   if(urls.length>100)throw Error('每批最多添加 100 条链接');
-  return urls.map(url=>{const u=new URL(url);const host=u.hostname.toLowerCase();const share=u.protocol==='https:'&&(['pan.baidu.com','pan.quark.cn','115.com','115cdn.com','anxia.com','pan.xunlei.com'].includes(host)&&u.pathname.startsWith('/s/')||['drive.google.com','1drv.ms','onedrive.live.com'].includes(host)||host.endsWith('.sharepoint.com')&&u.pathname.startsWith('/:'));return {url:share&&urls.length===1?raw:url,share};});
+  return urls.map(url=>{const u=new URL(url);const host=u.hostname.toLowerCase();const share=u.protocol==='https:'&&(['pan.baidu.com','pan.quark.cn','115.com','115cdn.com','anxia.com','pan.xunlei.com'].includes(host)&&u.pathname.startsWith('/s/')||['drive.google.com','1drv.ms','onedrive.live.com'].includes(host)||host.endsWith('.sharepoint.com')&&u.pathname.startsWith('/:'));return {url:share&&urls.length===1?raw:url,share,github:githubRepository(u)};});
+}
+function githubRepository(u){
+  if(u.protocol!=='https:'||u.hostname!=='github.com'||u.port||u.username||u.password)return null;
+  const parts=u.pathname.replace(/\/+$/,'').split('/').slice(1),owner=parts[0]||'',repo=(parts[1]||'').replace(/\.git$/,'');
+  const valid=s=>/^[A-Za-z0-9_.-]{1,100}$/.test(s)&&s!=='.'&&s!=='..';
+  if(!valid(owner)||!valid(repo))return null;
+  if(!(parts.length===2||parts[2]==='releases'&&(parts.length===3||parts.length===4&&parts[3]==='latest'||parts.length===5&&parts[3]==='tag'&&parts[4])))return null;
+  return {owner,repo,url:'https://github.com/'+owner+'/'+repo};
 }
 async function submitDownloadInput(raw){
-  const inputs=downloadInputs(raw),headers=headersInput(),group_id=batchUuid(),shares=[];
+  const inputs=downloadInputs(raw);
+  if(inputs.some(input=>input.github)){if(inputs.length!==1)throw Error('请每次浏览一个 GitHub 仓库或 Release，附件可批量勾选下载');await openGithub(inputs[0].url);return;}
+  const headers=headersInput(),group_id=batchUuid(),shares=[];
   let added=0;
   try{for(const input of inputs){if(input.share){shares.push(await api('/shares',{method:'POST',body:JSON.stringify({url:input.url,passcode:$('share-code').value.trim()})}));}else{await api('/transfers',{method:'POST',body:JSON.stringify({uri:input.url,headers,group_id,group_name:$('link-batch').value||'链接批次',create_folder:$('link-create-folder').checked})});}added++;}}
   catch(e){throw Error((added?'已接收 '+added+' 项；':'')+e.message);}
@@ -22,6 +32,53 @@ function appendTransferActions(job,actions){if(['selecting','paused'].includes(j
 async function appendTransferFiles(){const files=await api('/transfers/files');for(const file of files){const row=text('article','','account-row'),info=text('div');info.append(text('strong',file.name),text('p',bytes(file.size)+(file.seeding?' · 正在做种':'')));const link=text('a','保存到设备');link.href=file.url;link.download=file.name;row.append(info,link);$('local-files').append(row);}}
 
 function batchUuid(){const b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;const h=[...b].map(v=>v.toString(16).padStart(2,'0')).join('');return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join('-');}
+
+let githubCurrent=null,githubReleases=[],githubPage=1,githubRevision=0;
+function githubFiles(){return githubReleases[Number($('github-release').value)]?.files||[];}
+function updateGithubSelection(){
+  const indices=[...$('github-assets').querySelectorAll('input:checked')].map(n=>Number(n.value)),files=indices.map(i=>githubFiles()[i]),known=files.reduce((n,f)=>n+(f.size||0),0);
+  $('github-selection').textContent='已选 '+files.length+' 项 · '+bytes(known)+(files.some(f=>f.size==null)?' + 源码 ZIP 大小待下载时确定':'');$('github-download').disabled=!files.length;
+}
+function renderGithubFiles(){
+  const release=githubReleases[Number($('github-release').value)];$('github-assets').replaceChildren();
+  $('github-release-info').textContent=release?release.tag+(release.prerelease?' · 预发布':'')+(release.published_at?' · '+release.published_at.slice(0,10):''):'';
+  for(const [i,file]of githubFiles().entries()){
+    const row=text('label','','extracted-link'),check=document.createElement('input');check.type='checkbox';check.value=i;check.onchange=updateGithubSelection;
+    const info=text('div');info.append(text('strong',file.name),text('small',file.source?'此 Release 的源码 ZIP · 大小待下载时确定':bytes(file.size||0)));row.append(check,info);$('github-assets').append(row);
+  }
+  updateGithubSelection();
+}
+async function openGithub(raw,more=false){
+  const repo=githubRepository(new URL(raw));if(!repo)throw Error('请粘贴公开 GitHub 仓库或 Release 页面地址');
+  const revision=++githubRevision;
+  if(!more){githubCurrent={...repo,inspectUrl:raw};githubReleases=[];githubPage=1;$('github-repository').textContent=repo.owner+'/'+repo.repo;renderGithubFiles();$('github-release').replaceChildren();}
+  $('github-panel').hidden=false;$('github-more').disabled=true;$('github-note').textContent='正在读取 Release，或直接点击“下载仓库 ZIP”…';
+  $('github-all-releases').hidden=!/\/releases\/(?:tag|latest)(?:\/|$)/.test(new URL(raw).pathname);
+  try{
+    const result=await api('/github/inspect',{method:'POST',body:JSON.stringify({url:raw,page:more?githubPage+1:1})});
+    if(revision!==githubRevision)return;
+    const previous=$('github-release').value;githubReleases=more?[...githubReleases,...result.releases]:result.releases;githubPage=result.page;
+    $('github-release').replaceChildren();for(const [i,release]of githubReleases.entries()){const option=text('option',release.tag+' · '+release.name+(release.prerelease?' · 预发布':''));option.value=i;$('github-release').append(option);}
+    if(more)$('github-release').value=previous;
+    $('github-more').disabled=!result.has_more;$('github-note').textContent=githubReleases.length?'选择版本并勾选附件；仓库 ZIP 独立下载默认分支，Release 中的源码 ZIP 对应该版本。':'没有已发布的 Release，仍可下载仓库 ZIP。';renderGithubFiles();
+  }catch(e){if(revision===githubRevision)$('github-note').textContent=e.message+'。可重试解析，或直接下载仓库 ZIP。';}
+}
+async function downloadGithub(files,groupName,button){
+  if(!files.length)return;if(files.length>100)throw Error('每批最多选择 100 个附件');
+  const group_id=batchUuid(),headers=headersInput();let added=0;button.disabled=true;
+  try{
+    for(const file of files){await api('/transfers',{method:'POST',body:JSON.stringify({uri:file.url,name:file.name,headers,group_id,group_name:$('link-batch').value||groupName,create_folder:$('link-create-folder').checked})});added++;}
+    await loadJobs();setView('tasks');toast('已添加 '+added+' 个 GitHub 下载');
+  }catch(e){throw Error((added?'已添加 '+added+' 项；':'')+e.message);}finally{button.disabled=false;}
+}
+$('github-release').onchange=renderGithubFiles;
+$('github-more').onclick=()=>openGithub(githubCurrent.inspectUrl,true).catch(e=>toast(e.message));
+$('github-all-releases').onclick=()=>openGithub(githubCurrent.url).catch(e=>toast(e.message));
+$('github-close').onclick=()=>{githubRevision++;$('github-panel').hidden=true;};
+$('github-select-all').onclick=()=>{for(const n of $('github-assets').querySelectorAll('input'))n.checked=true;updateGithubSelection();};
+$('github-select-none').onclick=()=>{for(const n of $('github-assets').querySelectorAll('input'))n.checked=false;updateGithubSelection();};
+$('github-zip').onclick=async()=>{if(!githubCurrent)return;try{const {owner,repo}=githubCurrent;await downloadGithub([{url:'https://github.com/'+owner+'/'+repo+'/archive/HEAD.zip',name:repo+'.zip'}],owner+'/'+repo+' · 仓库源码',$('github-zip'));}catch(e){toast(e.message);}};
+$('github-download').onclick=async()=>{const files=[...$('github-assets').querySelectorAll('input:checked')].map(n=>githubFiles()[Number(n.value)]),release=githubReleases[Number($('github-release').value)];try{await downloadGithub(files,$('github-repository').textContent+' · '+release.tag,$('github-download'));}catch(e){toast(e.message);}finally{updateGithubSelection();}};
 
 let torrentCurrent=null;
 function openTorrent(job){torrentCurrent=job;$('torrent-files').replaceChildren();for(const f of job.files){const row=text('label','','torrent-row'),check=document.createElement('input');check.type='checkbox';check.value=f.index;check.checked=f.selected;check.onchange=updateTorrentSelection;row.append(check,text('span',f.name),text('small',bytes(f.length)));$('torrent-files').append(row);}updateTorrentSelection();$('torrent-dialog').showModal();}
