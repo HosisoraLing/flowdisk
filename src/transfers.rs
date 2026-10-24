@@ -110,6 +110,8 @@ pub struct Transfers {
     downloads: PathBuf,
     available: AtomicBool,
     protocol_list: Vec<String>,
+    connections_per_file: usize,
+    min_split_mib: usize,
     downloading: AtomicBool,
     pub received_delta: AtomicU64,
     pub sent_delta: AtomicU64,
@@ -220,6 +222,8 @@ impl Transfers {
             downloads,
             available: AtomicBool::new(false),
             protocol_list: vec!["http".into(), "https".into(), "ftp".into()],
+            connections_per_file: crate::number("LINK_CONNECTIONS_PER_FILE", 8, 16)?,
+            min_split_mib: crate::number("LINK_MIN_SPLIT_MIB", 1, 1024)?,
             downloading: AtomicBool::new(false),
             received_delta: AtomicU64::new(0),
             sent_delta: AtomicU64::new(0),
@@ -237,8 +241,10 @@ impl Transfers {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(6888);
+        let connections = engine.connections_per_file;
+        let min_split = engine.min_split_mib;
         let contents = format!(
-            "enable-rpc=true\nrpc-listen-all=false\nrpc-listen-port={port}\nrpc-secret={secret}\nrpc-save-upload-metadata=true\nenable-console-readout=false\nquiet=true\nconsole-log-level=error\nlog-level=error\nfile-allocation=none\ncontinue=true\nauto-file-renaming=false\nallow-overwrite=false\nsplit=8\nmax-connection-per-server=8\nmin-split-size=4M\nmax-concurrent-downloads=3\nmax-download-result=2000\nmax-tries=5\nretry-wait=2\nconnect-timeout=15\ntimeout=30\ncheck-certificate=true\nno-netrc=true\nbt-save-metadata=true\npause=true\npause-metadata=true\nfollow-torrent=false\nfollow-metalink=false\nseed-ratio=1.0\nseed-time=60\nlisten-port={bt_port}\ndht-listen-port={bt_port}\ndht-file-path={}\ndht-file-path6={}\ninput-file={}\nsave-session={}\nsave-session-interval=5\nauto-save-interval=5\nforce-save=true\ndir={}\n",
+            "enable-rpc=true\nrpc-listen-all=false\nrpc-listen-port={port}\nrpc-secret={secret}\nrpc-save-upload-metadata=true\nenable-console-readout=false\nquiet=true\nconsole-log-level=error\nlog-level=error\nfile-allocation=none\ncontinue=true\nauto-file-renaming=false\nallow-overwrite=false\nsplit={connections}\nmax-connection-per-server={connections}\nmin-split-size={min_split}M\nmax-concurrent-downloads=3\nmax-download-result=2000\nmax-tries=5\nretry-wait=2\nconnect-timeout=15\ntimeout=30\ncheck-certificate=true\nno-netrc=true\nbt-save-metadata=true\npause=true\npause-metadata=true\nfollow-torrent=false\nfollow-metalink=false\nseed-ratio=1.0\nseed-time=60\nlisten-port={bt_port}\ndht-listen-port={bt_port}\ndht-file-path={}\ndht-file-path6={}\ninput-file={}\nsave-session={}\nsave-session-interval=5\nauto-save-interval=5\nforce-save=true\ndir={}\n",
             data.join("dht.dat").display(),
             data.join("dht6.dat").display(),
             session.display(),
@@ -252,14 +258,26 @@ impl Transfers {
             fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).await?;
             fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).await?;
         }
-        match Command::new(std::env::var("ARIA2_BIN").unwrap_or_else(|_| "aria2c".into()))
+        let mut command =
+            Command::new(std::env::var("ARIA2_BIN").unwrap_or_else(|_| "aria2c".into()));
+        command
             .arg(format!("--conf-path={}", config.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // Compose uses uppercase names; aria2 only reads the lowercase proxy variables.
+        // Keep proxy credentials out of the config file and command-line arguments.
+        for (upper, lower) in [
+            ("HTTP_PROXY", "http_proxy"),
+            ("HTTPS_PROXY", "https_proxy"),
+            ("NO_PROXY", "no_proxy"),
+        ] {
+            if let Some(value) = std::env::var_os(upper) {
+                command.env(lower, value);
+            }
+        }
+        match command.spawn() {
             Ok(child) => {
                 *engine.child.lock().await = Some(child);
                 for _ in 0..30 {
@@ -847,6 +865,21 @@ async fn resume(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<
     app.0.transfers.downloading.store(true, Ordering::Relaxed);
     let native = app.0.bandwidth.native_active.load(Ordering::Relaxed);
     app.0.bandwidth.budget(&app, native).await?;
+    if !task.bt() {
+        // Restored aria2 sessions can still contain the old per-task split options.
+        let _ = app
+            .0
+            .transfers
+            .rpc(
+                "changeOption",
+                json!([task.gid, {
+                    "split":app.0.transfers.connections_per_file.to_string(),
+                    "max-connection-per-server":app.0.transfers.connections_per_file.to_string(),
+                    "min-split-size":format!("{}M",app.0.transfers.min_split_mib)
+                }]),
+            )
+            .await;
+    }
     if app
         .0
         .transfers
@@ -1036,7 +1069,9 @@ async fn files(State(app): State<App>) -> Json<Value> {
     Json(json!(files))
 }
 async fn status(State(app): State<App>) -> Json<Value> {
-    Json(json!({"available":app.0.transfers.available(),"protocols":app.0.transfers.protocols()}))
+    Json(
+        json!({"available":app.0.transfers.available(),"protocols":app.0.transfers.protocols(),"connections_per_file":app.0.transfers.connections_per_file,"min_split_mib":app.0.transfers.min_split_mib}),
+    )
 }
 pub fn routes() -> Router<App> {
     Router::new()

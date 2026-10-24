@@ -1,5 +1,5 @@
 "use strict";
-async function loadTools(){const settings=await api('/settings');$('download-limit').value=settings.download_limit/1024;$('upload-limit').value=settings.upload_limit/1024;$('seed-ratio').value=settings.seed_ratio;$('seed-minutes').value=settings.seed_minutes;const s=await api('/transfers/status');$('engine-state').textContent=s.available?'引擎已连接 · '+s.protocols.join(' / '):'链接引擎未启动，请使用 Docker 部署';}
+async function loadTools(){const settings=await api('/settings');$('download-limit').value=settings.download_limit/1024;$('upload-limit').value=settings.upload_limit/1024;$('seed-ratio').value=settings.seed_ratio;$('seed-minutes').value=settings.seed_minutes;const s=await api('/transfers/status');$('engine-state').textContent=s.available?'aria2 已连接 · '+s.protocols.join(' / ')+(s.connections_per_file?' · 每文件最多 '+s.connections_per_file+' 连接':''):'链接引擎未启动，请使用 Docker 部署';}
 function headersInput(){const result={};for(const line of $('link-headers').value.split('\n').map(s=>s.trim()).filter(Boolean)){const i=line.indexOf(':');if(i<=0)throw Error('请求头请使用 名称: 值 格式');result[line.slice(0,i).trim()]=line.slice(i+1).trim();}return result;}
 function downloadInputs(raw){
   const urls=raw.match(/(?:magnet:\?|(?:https?|ftp|sftp):\/\/)[^\s<>"，。；）】]+/gi)||[];
