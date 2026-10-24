@@ -19,11 +19,11 @@ async function loadLocal(path=localPath){
   function renderAgain(){loadLocal().catch(e=>toast(e.message));}
   for(const file of localEntries){const row=text('tr'),checkCell=text('td'),check=document.createElement('input');check.type='checkbox';check.checked=localPicked.has(file.path);check.disabled=file.locked;check.setAttribute('aria-label','选择 '+file.name);check.onchange=()=>{check.checked?localPicked.add(file.path):localPicked.delete(file.path);updateLocalSelection();all.checked=selectable.every(e=>localPicked.has(e.path));};checkCell.append(check);
     const info=text('td'),line=text('div','','local-name');line.append(text('span',file.is_dir?'▰':'◇','kind-icon'));if(file.is_dir)line.append(button(file.name,()=>loadLocal(file.path).catch(e=>toast(e.message)),'local-folder'));else line.append(text('strong',file.name));info.append(line);if(file.seeding?.length){const seeds=text('div','','local-seed-controls');seeds.dataset.seedIds=file.seeding.map(s=>s.id).join(',');drawLocalSeedControls(seeds,file.seeding);info.append(seeds);}if(file.locked)info.append(text('small','包含下载或做种内容，暂不可移动','local-locked'));if(file.passwords?.length)info.append(passwordNotes(file.passwords));
-    const actions=text('td','','local-actions');if(!file.is_dir){const link=text('a','保存到设备');link.href=file.download_url||('/api/local/tree/file?path='+encodeURIComponent(file.path));link.download=file.name;actions.append(link);}
+    const actionCell=text('td'),actions=text('div','','local-actions');if(!file.is_dir){const link=text('a','保存到设备');link.href=file.download_url||('/api/local/tree/file?path='+encodeURIComponent(file.path));link.download=file.name;actions.append(link);}
     const move=button('移动',()=>openLocalMove([file.path]));move.disabled=file.locked;
     const rename=button('重命名',async()=>{const name=prompt('新的名称',file.name);if(!name||name===file.name)return;try{await localOperation({action:'rename',paths:[file.path],name});toast('已重命名');}catch(e){toast(e.message);}});rename.disabled=file.locked;
     const remove=button('删除',async()=>{if(!confirm(file.is_dir?'删除空文件夹“'+file.name+'”？非空文件夹不会被删除。':'删除服务器本地文件“'+file.name+'”？云端原文件会保留。'))return;try{await localOperation({action:'delete',paths:[file.path]});toast('已删除');}catch(e){toast(e.message);}});remove.disabled=file.locked;
-    actions.append(move,rename,remove);row.append(checkCell,info,text('td',file.is_dir?'文件夹':bytes(file.size)),actions);body.append(row);
+    actions.append(move,rename,remove);actionCell.append(actions);row.append(checkCell,info,text('td',file.is_dir?'文件夹':bytes(file.size)),actionCell);body.append(row);
   }table.append(body);$('local-files').append(table);
 }
 $('refresh-local').onclick=()=>loadLocal().catch(e=>toast(e.message));
