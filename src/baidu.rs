@@ -113,6 +113,12 @@ fn scalar(v: &Value) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| v.to_string())
 }
+fn uint(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.parse().ok())
+}
+fn is_directory(v: &Value) -> bool {
+    v["isdir"] == true || uint(&v["isdir"]) == Some(1)
+}
 fn native_entry(v: &Value) -> Result<Value> {
     let name = v["server_filename"]
         .as_str()
@@ -120,7 +126,7 @@ fn native_entry(v: &Value) -> Result<Value> {
         .context("百度文件名缺失")?;
     ensure!(crate::control::valid_name(name), "百度文件名不合法");
     Ok(
-        json!({"name":name,"size":v["size"].as_u64().unwrap_or(0),"is_dir":v["isdir"]==1||v["isdir"]==true,"modified":v["server_mtime"].as_u64().unwrap_or(0)*1000,"hash_info":{"md5":v["md5"]},"raw_url":""}),
+        json!({"name":name,"size":uint(&v["size"]).unwrap_or(0),"is_dir":is_directory(v),"modified":uint(&v["server_mtime"]).unwrap_or(0)*1000,"hash_info":{"md5":v["md5"]},"raw_url":""}),
     )
 }
 impl Baidu {
@@ -535,7 +541,7 @@ impl Baidu {
         }
         ensure!(
             value["path"].as_str() == Some(path)
-                && value["size"].as_u64() == Some(bytes.len() as u64),
+                && uint(&value["size"]) == Some(bytes.len() as u64),
             "百度未确认文件完整保存，请刷新目录后检查"
         );
         self.cache.lock().await.clear();
@@ -760,7 +766,7 @@ impl Baidu {
                     seen.insert(scalar(&file["fs_id"])) && seen.len() <= 5000,
                     "分享过大或目录重复，请拆分分享"
                 );
-                if file["isdir"] == 1 {
+                if is_directory(&file) {
                     let dir = file["path"].as_str().context("百度分享文件夹路径缺失")?;
                     for page in 1..=50 {
                         let u = Url::parse_with_params(
@@ -786,7 +792,7 @@ impl Baidu {
                     }
                 } else {
                     bytes = bytes
-                        .checked_add(file["size"].as_u64().context("百度分享大小缺失")?)
+                        .checked_add(uint(&file["size"]).context("百度分享大小缺失")?)
                         .context("分享大小超出范围")?;
                     count += 1;
                 }
@@ -796,7 +802,7 @@ impl Baidu {
         let destination = format!("/FlowDisk分享/分享-{id}");
         for dir in ["/FlowDisk分享".to_owned(), destination.clone()] {
             match self.item(&a, &dir).await {
-                Ok(v) => ensure!(v["isdir"] == 1, "分享接收位置已被同名文件占用"),
+                Ok(v) => ensure!(is_directory(&v), "分享接收位置已被同名文件占用"),
                 Err(e) if e.to_string().contains("文件不存在") => self.mkdir(&a, &dir).await?,
                 Err(e) => return Err(e),
             }
@@ -811,11 +817,10 @@ impl Baidu {
             })
             .collect();
         for batch in missing.chunks(100) {
-            let fids: Vec<_> = batch.iter().map(|f| f["fs_id"].clone()).collect();
-            ensure!(
-                fids.iter().all(|v| v.as_u64().is_some()),
-                "百度分享文件标识不合法"
-            );
+            let fids = batch
+                .iter()
+                .map(|f| uint(&f["fs_id"]).context("百度分享文件标识不合法"))
+                .collect::<Result<Vec<_>>>()?;
             let u = Url::parse_with_params(
                 self.base.join("share/transfer")?.as_str(),
                 [
@@ -1066,6 +1071,25 @@ pub async fn qr_poll(
 mod tests {
     use super::*;
     #[test]
+    fn native_entries_accept_mixed_numeric_encodings() {
+        for flag in [json!(1), json!("1"), json!(true)] {
+            let entry = native_entry(
+                &json!({"server_filename":"folder","isdir":flag,"size":"0","server_mtime":"123"}),
+            )
+            .unwrap();
+            assert_eq!(entry["is_dir"], true);
+            assert_eq!(entry["modified"], 123000);
+        }
+        for flag in [json!(0), json!("0"), json!(false)] {
+            let entry = native_entry(
+                &json!({"server_filename":"file.bin","isdir":flag,"size":"4294967296"}),
+            )
+            .unwrap();
+            assert_eq!(entry["is_dir"], false);
+            assert_eq!(entry["size"], 4294967296u64);
+        }
+    }
+    #[test]
     fn parsing_and_download_domains() {
         assert!(cookie_map("BDUSS=abcdefgh; STOKEN=a==").is_ok());
         assert!(cookie_map("BDUSS=abcdefgh\r\nCookie:x").is_err());
@@ -1104,6 +1128,7 @@ mod protocol_tests {
     use std::sync::Arc;
     struct Fixture {
         files: Vec<Value>,
+        share_items: Option<Vec<Value>>,
         transfers: usize,
         expired: bool,
         asynchronous: bool,
@@ -1226,17 +1251,40 @@ mod protocol_tests {
             }
             "/share/list" => {
                 assert!(cookie.contains("BDCLND=unit-share-cookie"));
-                json!({"errno":0,"list":[file("/shared.bin",false,9)]})
+                let items = if q["root"] == "0" {
+                    assert_eq!(q["dir"], "/folder");
+                    vec![
+                        json!({"server_filename":"nested.bin","path":"/folder/nested.bin","isdir":"0","size":"4","fs_id":"11"}),
+                        json!({"server_filename":"empty.bin","path":"/folder/empty.bin","isdir":0,"size":0,"fs_id":12}),
+                    ]
+                } else {
+                    s.share_items
+                        .clone()
+                        .unwrap_or_else(|| vec![file("/shared.bin", false, 9)])
+                };
+                json!({"errno":0,"list":items})
             }
             "/share/transfer" => {
                 assert_eq!(q["ondup"], "fail");
-                assert_eq!(form["fsidlist"], "[9]");
+                let items = s
+                    .share_items
+                    .clone()
+                    .unwrap_or_else(|| vec![file("/shared.bin", false, 9)]);
+                let ids: Vec<_> = items.iter().map(|f| uint(&f["fs_id"]).unwrap()).collect();
+                assert_eq!(form["fsidlist"], json!(ids).to_string());
                 s.transfers += 1;
                 if s.asynchronous {
                     json!({"errno":0,"taskid":99})
                 } else {
-                    s.files
-                        .push(file(&format!("{}/shared.bin", form["path"]), false, 9));
+                    for mut item in items {
+                        item["path"] = format!(
+                            "{}/{}",
+                            form["path"],
+                            item["server_filename"].as_str().unwrap()
+                        )
+                        .into();
+                        s.files.push(item);
+                    }
                     json!({"errno":0})
                 }
             }
@@ -1248,6 +1296,7 @@ mod protocol_tests {
     async fn native_adapter_protocol_and_persistence() {
         let state = Arc::new(Mutex::new(Fixture {
             files: vec![file("/file.bin", false, 1)],
+            share_items: None,
             transfers: 0,
             expired: false,
             asynchronous: false,
@@ -1389,6 +1438,34 @@ mod protocol_tests {
         assert_eq!(paths, vec![format!("/FlowDisk分享/分享-{id}")]);
         native.import_share(id, &share, "abcd").await.unwrap();
         assert_eq!(state.lock().await.transfers, 1);
+        state.lock().await.share_items = Some(vec![
+            json!({"server_filename":"folder","path":"/folder","isdir":"1","size":"0","fs_id":"10"}),
+            file("/direct.bin", false, 13),
+        ]);
+        let estimate = native
+            .inspect_share(Uuid::new_v4(), &share, "abcd")
+            .await
+            .unwrap();
+        assert_eq!(estimate, json!({"required_bytes":7,"file_count":3}));
+        assert_eq!(state.lock().await.transfers, 1); // Inspection never transfers files.
+        let mixed_id = Uuid::new_v4();
+        native.import_share(mixed_id, &share, "abcd").await.unwrap();
+        native.import_share(mixed_id, &share, "abcd").await.unwrap();
+        assert_eq!(state.lock().await.transfers, 2);
+        for size in [Value::Null, json!(-1), json!("not-a-size")] {
+            let mut item = file("/invalid.bin", false, 14);
+            item["size"] = size;
+            state.lock().await.share_items = Some(vec![item]);
+            assert!(
+                native
+                    .inspect_share(Uuid::new_v4(), &share, "abcd")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("大小缺失")
+            );
+        }
+        state.lock().await.share_items = None;
         state.lock().await.asynchronous = true;
         assert!(
             native
