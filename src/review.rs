@@ -226,6 +226,10 @@ pub async fn collect(app: &App, roots: &[String]) -> ApiResult<Vec<Entry>> {
         }
     }
     let mut entries: Vec<_> = all.into_values().collect();
+    finish_entries(&mut entries)?;
+    Ok(entries)
+}
+pub(crate) fn finish_entries(entries: &mut [Entry]) -> anyhow::Result<()> {
     let files: Vec<_> = entries
         .iter()
         .filter(|e| !e.is_dir)
@@ -239,14 +243,14 @@ pub async fn collect(app: &App, roots: &[String]) -> ApiResult<Vec<Entry>> {
             .try_fold(0u64, |sum, n| sum.checked_add(n))
             .context("分享总大小超出范围")?;
     }
-    annotate(&mut entries);
-    Ok(entries)
+    annotate(entries);
+    Ok(())
 }
 async fn contents(State(app): State<App>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     let all = app.0.control.shares.lock().await;
     let s = all.get(&id).ok_or_else(|| bad("分享任务不存在"))?;
     Ok(Json(
-        json!({"entries":s.entries,"roots":s.roots,"capacity":s.capacity,"status":s.status,"message":s.message}),
+        json!({"entries":s.entries,"roots":s.roots,"capacity":s.capacity,"status":s.status,"message":s.message,"untransferred":s.untransferred}),
     ))
 }
 #[derive(Deserialize)]
@@ -371,18 +375,123 @@ async fn share_preview(
     headers: HeaderMap,
     method: axum::http::Method,
 ) -> ApiResult<Response> {
-    {
+    let share = {
         let all = app.0.control.shares.lock().await;
         let s = all.get(&id).ok_or_else(|| bad("分享任务不存在"))?;
-        if !["ready", "queued"].contains(&s.status.as_str())
+        if !(["ready", "queued"].contains(&s.status.as_str())
+            || s.untransferred
+                && ["awaiting_transfer", "insufficient_capacity"].contains(&s.status.as_str()))
             || !s.entries.iter().any(|e| e.path == q.path && !e.is_dir)
             || !s.roots.iter().any(|r| inside(r, &q.path))
         {
             return Err(bad("预览文件不属于已准备的分享"));
         }
+        s.clone()
+    };
+    if share.untransferred {
+        let entry = share.entries.iter().find(|e| e.path == q.path).unwrap();
+        let (kind, mime) = media(&entry.name);
+        if kind == "other" {
+            return Err(bad("此格式暂不支持在线预览，请下载原文件"));
+        }
+        if entry.size == 0 {
+            return Ok((
+                [(header::CONTENT_TYPE, mime), (header::CONTENT_LENGTH, "0")],
+                Body::empty(),
+            )
+                .into_response());
+        }
+        let (link, thumbnail) = app
+            .0
+            .gateway
+            .baidu
+            .share_preview_link(
+                id,
+                &reqwest::Url::parse(&share.url).map_err(anyhow::Error::from)?,
+                &share.passcode,
+                &q.path,
+            )
+            .await
+            .map_err(|e| bad(&format!("无需转存的预览暂不可用：{e}")))?;
+        if thumbnail {
+            let response = app
+                .0
+                .client
+                .get(link.url)
+                .headers(link.headers)
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::new(e.without_url()))?;
+            if !response.status().is_success() {
+                return Err(bad("百度分享图片预览暂不可用"));
+            }
+            let mime = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            if ![
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/gif",
+                "image/avif",
+                "image/bmp",
+            ]
+            .contains(&mime.as_str())
+            {
+                return Err(bad("百度未返回可预览的图片格式"));
+            }
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| anyhow::Error::new(e.without_url()))?;
+                if body.len() + chunk.len() > 24 * 1024 * 1024 {
+                    return Err(bad("图片预览超过 24 MB"));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let length = body.len().to_string();
+            return Ok((
+                [
+                    (header::CONTENT_TYPE, mime.as_str()),
+                    (header::CONTENT_LENGTH, length.as_str()),
+                    (header::CONTENT_DISPOSITION, "inline"),
+                ],
+                if method == axum::http::Method::HEAD {
+                    Body::empty()
+                } else {
+                    Body::from(body)
+                },
+            )
+                .into_response());
+        }
+        let meta = crate::gateway::Metadata {
+            name: entry.name.clone(),
+            size: entry.size,
+            is_dir: false,
+            modified: String::new(),
+            hash_info: Value::Null,
+            raw_url: String::new(),
+            sign: String::new(),
+            provider: "BaiduNative".into(),
+        };
+        return preview_remote(
+            &app,
+            meta,
+            link,
+            &headers,
+            method == axum::http::Method::HEAD,
+        )
+        .await;
     }
     preview(&app, &q.path, &headers, method == axum::http::Method::HEAD).await
 }
+
 async fn cloud_preview(
     State(app): State<App>,
     Query(q): Query<PreviewPath>,
@@ -460,6 +569,15 @@ async fn preview(app: &App, path: &str, headers: &HeaderMap, head: bool) -> ApiR
         }
     }
     let (meta, link) = app.0.gateway.resolve(path).await?;
+    preview_remote(app, meta, link, headers, head).await
+}
+async fn preview_remote(
+    app: &App,
+    meta: crate::gateway::Metadata,
+    link: crate::gateway::Link,
+    headers: &HeaderMap,
+    head: bool,
+) -> ApiResult<Response> {
     let (kind, mime) = media(&meta.name);
     if kind == "other" {
         return Err(bad("此格式暂不支持在线预览，请下载原文件"));

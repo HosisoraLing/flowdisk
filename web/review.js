@@ -1,5 +1,5 @@
 'use strict';
-let reviewId=null, reviewData=null, reviewDir='', reviewPicked=new Set(), reviewLoading=false, reviewStatus='', previewAbort=null;
+let reviewId=null, reviewData=null, reviewDir='', reviewPicked=new Set(), reviewLoading=false, reviewStatus='', previewAbort=null, pendingReviewDownload=null;
 const typeNames={image:'图片',audio:'音频',video:'视频',text:'文本',archive:'压缩包',other:'文件',folder:'文件夹'};
 function fileKind(name) {
   const ext=name.toLowerCase().split('.').pop();
@@ -19,16 +19,16 @@ function stopPreview(){
   for(const image of $('preview-content').querySelectorAll('img'))image.removeAttribute('src');
   $('preview-content').replaceChildren();$('preview-info').replaceChildren();
 }
-function closeShare(){stopPreview();reviewId=null;reviewData=null;reviewPicked.clear();$('share-dialog').close();}
-$('close-share').onclick=closeShare;$('share-dialog').addEventListener('cancel',()=>{stopPreview();reviewId=null;reviewData=null;});
+function closeShare(){pendingReviewDownload=null;stopPreview();reviewId=null;reviewData=null;reviewPicked.clear();$('share-dialog').close();}
+$('close-share').onclick=closeShare;$('share-dialog').addEventListener('cancel',()=>{pendingReviewDownload=null;stopPreview();reviewId=null;reviewData=null;});
 async function openShare(id){
-  stopPreview();reviewId=id;reviewData=null;reviewPicked.clear();reviewStatus='';reviewDir='';
+  pendingReviewDownload=null;stopPreview();reviewId=id;reviewData=null;reviewPicked.clear();reviewStatus='';reviewDir='';
   $('share-dialog').classList.remove('cloud-only');$('share-title').textContent='分享内容';$('share-search').value='';$('share-type').value='all';$('share-scope').value='folder';
   $('share-explorer').hidden=true;$('share-capacity').replaceChildren();$('share-state').textContent='正在读取分享…';
   if(!$('share-dialog').open)$('share-dialog').showModal();updateReviewSelection();
   try{
     const shares=await api('/shares');const share=shares.find(s=>s.id===id);
-    if(share&&['queued','ready','failed','cancelled'].includes(share.status)&&!share.has_contents)await api('/shares/'+id+'/retry',{method:'POST'});
+    if(share&&(['queued','ready','failed','cancelled'].includes(share.status)||share.provider==='baidu'&&['awaiting_transfer','insufficient_capacity'].includes(share.status))&&!share.has_contents)await api('/shares/'+id+'/retry',{method:'POST'});
     await loadShareContents();
   }catch(e){$('share-state').textContent=e.message;}
 }
@@ -36,10 +36,10 @@ async function loadShareContents(){
   if(!reviewId||reviewLoading)return;reviewLoading=true;const id=reviewId;
   try{
     const data=await api('/shares/'+id+'/contents');if(reviewId!==id)return;
-    const first=!reviewData?.entries?.length;reviewData=data;reviewStatus=data.status;
+    const first=!reviewData?.entries?.length||reviewData.untransferred&&!data.untransferred;reviewData=data;reviewStatus=data.status;
     $('share-subtitle').textContent=data.entries.length?`${data.entries.filter(e=>!e.is_dir).length} 个文件 · ${bytes(data.entries.filter(e=>!e.is_dir).reduce((s,e)=>s+e.size,0))} · 勾选后再下载`:'先准备内容，确认后再开始下载';
     renderCapacity(data.capacity);
-    const ready=['ready','queued'].includes(data.status)&&data.entries.length;
+    const ready=(['ready','queued'].includes(data.status)||data.untransferred&&['awaiting_transfer','insufficient_capacity'].includes(data.status))&&data.entries.length;
     $('share-explorer').hidden=!ready;$('share-state').replaceChildren();
     if(!ready){
       $('share-state').append(text('p',data.message||'正在解析分享内容…'));
@@ -53,11 +53,21 @@ async function loadShareContents(){
       }
       if(data.status==='waiting_login')$('share-state').append(button('连接网盘',()=>{const s=lastShares.find(s=>s.id===id);if(s)openAccount(s.provider);},'primary'));
     }else{
+      if(data.untransferred)$('share-state').append(text('p','浏览分享无需转存；图片使用官方预览图。选择下载时才会询问转存。'));
+      if(data.untransferred&&data.capacity?.enough===false)$('share-state').append(button('管理网盘空间',()=>{closeShare();setView('browse');browse('/baidu',1,true);}));
       if(first)reviewDir=data.roots.length===1&&data.entries.find(e=>e.path===data.roots[0])?.is_dir?data.roots[0]:'';
       renderReviewFiles();
       if(first){$('preview-title').textContent='文件预览';$('preview-content').replaceChildren(text('div','选择一个文件，查看图片、音频、视频或文本预览。','preview-placeholder'));}
     }
     updateReviewSelection();
+    if(pendingReviewDownload?.id===id&&!data.untransferred&&['ready','queued'].includes(data.status)){
+      const pending=pendingReviewDownload;pendingReviewDownload=null;
+      const mapped=pending.files.map(file=>{const path=data.roots[0]+file.suffix;return data.entries.find(e=>e.path===path&&!e.is_dir&&e.name===file.name&&e.size===file.size);});
+      if(mapped.some(e=>!e)){reviewPicked.clear();renderReviewFiles();toast('分享内容发生变化，请重新选择下载文件');return;}
+      reviewPicked=new Set(mapped.map(e=>e.path));await startReviewDownload(pending.allowAds,pending.createFolder);
+    }else if(pendingReviewDownload?.id===id&&['failed','insufficient_capacity'].includes(data.status)){
+      pendingReviewDownload=null;toast(data.message||'未能准备下载，请检查网盘状态后重试');
+    }
   }catch(e){if(reviewId===id)$('share-state').textContent=e.message;}finally{reviewLoading=false;}
 }
 let lastShares=[];
@@ -121,7 +131,7 @@ function renderReviewFiles(){
   updateReviewSelection();
 }
 function updateReviewSelection(){
-  const chosen=chosenFiles(),ads=chosen.filter(e=>e.ad_reason),ready=reviewData&&['ready','queued'].includes(reviewData.status);
+  const chosen=chosenFiles(),ads=chosen.filter(e=>e.ad_reason),ready=reviewData&&(['ready','queued'].includes(reviewData.status)||reviewData.untransferred&&['awaiting_transfer','insufficient_capacity'].includes(reviewData.status));
   $('share-selection').textContent=chosen.length?`已选 ${chosen.length} 个文件 · ${bytes(chosen.reduce((n,e)=>n+e.size,0))}${ads.length?' · 含 '+ads.length+' 个疑似广告':''}`:'尚未选择文件';
   $('share-download').disabled=!ready||!chosen.length||chosen.length>1000;
   $('share-download').textContent=chosen.length>1000?'一次最多 1000 个文件':'下载所选 →';
@@ -131,12 +141,21 @@ $('share-check-all').onchange=()=>{const on=$('share-check-all').checked;for(con
 $('share-select-none').onclick=()=>{reviewPicked.clear();renderReviewFiles();};
 $('share-select-entire').onclick=()=>{reviewPicked=new Set(reviewData.roots);renderReviewFiles();};
 for(const id of ['share-search','share-type','share-scope'])$(id).addEventListener(id==='share-search'?'input':'change',renderReviewFiles);
-async function startReviewDownload(allowAds=false){
+async function startReviewDownload(allowAds=false,createFolder=$('share-create-folder').checked){
   $('share-download').disabled=true;
   try{
-    const result=await api('/shares/'+reviewId+'/download',{method:'POST',body:JSON.stringify({paths:[...reviewPicked],allow_ads:allowAds,create_folder:$('share-create-folder').checked})});
+    if(reviewData.untransferred){
+      const capacity=reviewData.capacity;
+      if(capacity?.enough===false)throw Error('网盘空间不足，可以继续浏览；下载前请先管理网盘空间');
+      if(!confirm('下载需要先将此分享转存到你的百度网盘（整个分享约 '+bytes(capacity?.required||0)+'）。'+(capacity?.known?'转存后预计剩余 '+bytes(capacity.after)+'。':'当前容量未知。')+'确认转存后，会只下载你勾选的文件。')){updateReviewSelection();return;}
+      const files=chosenFiles().map(entry=>{const root=reviewData.entries.find(e=>reviewData.roots.includes(e.path)&&within(e.path,entry.path));return {suffix:'/'+root.name+entry.path.slice(root.path.length),name:entry.name,size:entry.size};});
+      pendingReviewDownload={id:reviewId,files,allowAds,createFolder};
+      await api('/shares/'+reviewId+'/prepare',{method:'POST',body:JSON.stringify({allow_unknown_capacity:capacity?.known!==true})});
+      toast('正在准备所选下载，转存完成后会自动加入任务');await loadShareContents();return;
+    }
+    const result=await api('/shares/'+reviewId+'/download',{method:'POST',body:JSON.stringify({paths:[...reviewPicked],allow_ads:allowAds,create_folder:createFolder})});
     toast(`已将 ${result.jobs.length} 个文件加入同一下载组`);closeShare();setView('tasks');await loadJobs();await loadShares();
-  }catch(e){toast(e.message);updateReviewSelection();}
+  }catch(e){pendingReviewDownload=null;toast(e.message);updateReviewSelection();}
 }
 $('share-download').onclick=()=>{
   const ads=chosenFiles().filter(e=>e.ad_reason);
@@ -150,7 +169,7 @@ $('ad-remove').onclick=()=>{reviewPicked=new Set(chosenFiles().filter(e=>!e.ad_r
 $('ad-keep').onclick=()=>{$('ad-dialog').close();startReviewDownload(true);};
 async function showFilePreview(path,name,endpoint){
   stopPreview();$('preview-title').textContent=name;const kind=fileKind(name),url='/api'+endpoint+'?'+new URLSearchParams({path});
-  const entry=reviewData?.entries.find(e=>e.path===path);$('preview-info').append(text('small',typeNames[kind]+(entry?' · '+bytes(entry.size):'')));
+  const entry=reviewData?.entries.find(e=>e.path===path);$('preview-info').append(text('small',typeNames[kind]+(entry?' · '+bytes(entry.size):'')));if(reviewData?.untransferred&&kind==='image')$('preview-info').append(text('small','无需转存，显示百度提供的图片预览图；下载时保存原文件。'));
   if(entry?.ad_reason)$('preview-info').append(text('p','可能是广告：'+entry.ad_reason,'ad-badge'));
   if(entry?.passwords.length)$('preview-info').append(passwordNotes(entry.passwords));
   if(kind==='image'){

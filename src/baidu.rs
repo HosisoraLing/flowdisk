@@ -29,6 +29,12 @@ struct Account {
     cookie: String,
     token: String,
 }
+struct ShareListing {
+    account: Account,
+    cookies: BTreeMap<String, String>,
+    info: Value,
+    files: Vec<Value>,
+}
 pub struct Baidu {
     client: Client,
     account: Mutex<Option<Account>>,
@@ -664,13 +670,7 @@ impl Baidu {
         let v = self.api(&a, "api/quota", vec![], None).await?;
         Ok(json!({"total_space":v["total"],"used_space":v["used"]}))
     }
-    async fn share_request(
-        &self,
-        id: Uuid,
-        url: &Url,
-        passcode: &str,
-        inspect: bool,
-    ) -> Result<Value> {
+    async fn share_listing(&self, url: &Url, passcode: &str) -> Result<ShareListing> {
         let a = self.current().await?;
         let share_code = url
             .path()
@@ -756,7 +756,192 @@ impl Baidu {
             ensure!(page < 100, "分享目录过大");
         }
         ensure!(!files.is_empty(), "百度分享目录为空");
+        Ok(ShareListing {
+            account: a,
+            cookies: map,
+            info,
+            files,
+        })
+    }
+    pub async fn share_preview_link(
+        &self,
+        id: Uuid,
+        url: &Url,
+        passcode: &str,
+        path: &str,
+    ) -> Result<(Link, bool)> {
+        let remote = path
+            .strip_prefix(&format!("/share/{id}"))
+            .filter(|p| valid_path(p) && *p != "/")
+            .context("分享预览路径不合法")?;
+        let ShareListing {
+            cookies: mut map,
+            info,
+            files,
+            ..
+        } = self.share_listing(url, passcode).await?;
+        ensure!(
+            files.iter().any(|f| f["path"].as_str().is_some_and(
+                |p| p == remote || is_directory(f) && crate::review::inside(p, remote)
+            )),
+            "文件不属于此分享"
+        );
+        let shareid = scalar(&info["shareid"]);
+        let owner = scalar(info.get("share_uk").unwrap_or(&info["uk"]));
+        let mut found = files.iter().find(|f| f["path"] == remote).cloned();
+        if found.is_none() {
+            let parent = remote.rsplit_once('/').context("分享预览路径不合法")?.0;
+            for page in 1..=50 {
+                let u = Url::parse_with_params(
+                    self.base.join("share/list")?.as_str(),
+                    [
+                        ("shareid", shareid.clone()),
+                        ("uk", owner.clone()),
+                        ("root", "0".into()),
+                        ("dir", parent.into()),
+                        ("num", "100".into()),
+                        ("page", page.to_string()),
+                        ("web", "1".into()),
+                        ("clienttype", "0".into()),
+                    ],
+                )?;
+                let value = self.call(u, Method::GET, None, &mut map).await?;
+                let rows = value["list"].as_array().context("百度分享目录缺失")?;
+                if let Some(file) = rows.iter().find(|f| f["path"] == remote) {
+                    found = Some(file.clone());
+                    break;
+                }
+                if rows.len() < 100 {
+                    break;
+                }
+            }
+        }
+        let file = found.context("分享文件不存在，请重新检查分享")?;
+        ensure!(!is_directory(&file), "不能直接预览文件夹");
+        let fid = uint(&file["fs_id"]).context("百度分享文件标识不合法")?;
+        let thumbnail = if crate::review::media(file["server_filename"].as_str().unwrap_or("file"))
+            .0
+            == "image"
+        {
+            ["url3", "url2", "url1"].iter().find_map(|key| {
+                file["thumbs"][key]
+                    .as_str()
+                    .and_then(|s| Url::parse(s).ok())
+                    .filter(official_download)
+            })
+        } else {
+            None
+        };
+        let (link, thumbnail) = if let Some(link) = thumbnail {
+            (link, true)
+        } else {
+            // This endpoint expects the full short code including the leading '1'.
+            let u = Url::parse_with_params(
+                self.base.join("share/tplconfig")?.as_str(),
+                [
+                    ("surl", url.path().strip_prefix("/s/").unwrap_or("")),
+                    ("fields", "sign,timestamp"),
+                    ("channel", "chunlei"),
+                    ("web", "1"),
+                    ("app_id", "250528"),
+                    ("clienttype", "0"),
+                ],
+            )?;
+            let config = self.call(u, Method::GET, None, &mut map).await?;
+            let sign = config["data"]["sign"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("百度未提供分享预览签名")?;
+            let timestamp =
+                uint(&config["data"]["timestamp"]).context("百度未提供分享预览时间戳")?;
+            let cookie = map
+                .get("BDCLND")
+                .context("分享访问凭据已失效，请重新检查分享")?;
+            // Decode Baidu's escaped cookie while retaining literal '+' characters.
+            let decoded = Url::parse(&format!(
+                "https://pan.baidu.com/?value={}",
+                cookie.replace('+', "%2B")
+            ))?
+            .query_pairs()
+            .next()
+            .context("分享访问凭据不合法")?
+            .1
+            .into_owned();
+            let u = Url::parse_with_params(
+                self.base.join("api/sharedownload")?.as_str(),
+                [
+                    ("sign", sign.to_owned()),
+                    ("timestamp", timestamp.to_string()),
+                    ("app_id", "250528".into()),
+                    ("channel", "chunlei".into()),
+                    ("clienttype", "12".into()),
+                    ("web", "1".into()),
+                ],
+            )?;
+            let value = self
+                .call(
+                    u,
+                    Method::POST,
+                    Some(&[
+                        ("encrypt".into(), "0".into()),
+                        ("product".into(), "share".into()),
+                        ("type".into(), "nolimit".into()),
+                        ("primaryid".into(), shareid),
+                        ("uk".into(), owner),
+                        ("fid_list".into(), json!([fid]).to_string()),
+                        ("extra".into(), json!({"sekey":decoded}).to_string()),
+                    ]),
+                    &mut map,
+                )
+                .await?;
+            let link = Url::parse(
+                value["list"][0]["dlink"]
+                    .as_str()
+                    .context("百度暂未提供无需转存的预览链接")?,
+            )?;
+            (link, false)
+        };
+        ensure!(official_download(&link), "百度返回了非官方预览地址");
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_str(&cookies(&map))?);
+        headers.insert(USER_AGENT, HeaderValue::from_static(NETDISK_UA));
+        headers.insert(REFERER, HeaderValue::from_static("https://pan.baidu.com/"));
+        Ok((
+            Link {
+                url: link,
+                headers,
+                concurrency: 1,
+                max_range: 0,
+            },
+            thumbnail,
+        ))
+    }
+    async fn share_request(
+        &self,
+        id: Uuid,
+        url: &Url,
+        passcode: &str,
+        inspect: bool,
+    ) -> Result<Value> {
+        let ShareListing {
+            account: a,
+            cookies: mut map,
+            info,
+            files,
+        } = self.share_listing(url, passcode).await?;
+        let shareid = scalar(&info["shareid"]);
+        let owner = scalar(info.get("share_uk").unwrap_or(&info["uk"]));
         if inspect {
+            let prefix = format!("/share/{id}");
+            let roots = files
+                .iter()
+                .map(|f| {
+                    let path = f["path"].as_str().context("百度分享路径缺失")?;
+                    ensure!(valid_path(path) && path != "/", "百度分享路径不合法");
+                    Ok(format!("{prefix}{path}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut entries = Vec::new();
             let mut pending = files;
             let mut seen = std::collections::BTreeSet::new();
             let mut bytes = 0u64;
@@ -766,8 +951,31 @@ impl Baidu {
                     seen.insert(scalar(&file["fs_id"])) && seen.len() <= 5000,
                     "分享过大或目录重复，请拆分分享"
                 );
+                let raw_path = file["path"].as_str().context("百度分享路径缺失")?;
+                ensure!(
+                    valid_path(raw_path) && raw_path != "/",
+                    "百度分享路径不合法"
+                );
+                let path = format!("{prefix}{raw_path}");
+                ensure!(
+                    roots.iter().any(|r| crate::review::inside(r, &path)),
+                    "百度返回了分享范围之外的文件"
+                );
+                let item = native_entry(&file)?;
+                entries.push(crate::review::Entry {
+                    path,
+                    name: item["name"].as_str().unwrap().into(),
+                    size: if is_directory(&file) {
+                        0
+                    } else {
+                        uint(&file["size"]).context("百度分享大小缺失")?
+                    },
+                    is_dir: is_directory(&file),
+                    ad_reason: None,
+                    passwords: vec![],
+                });
                 if is_directory(&file) {
-                    let dir = file["path"].as_str().context("百度分享文件夹路径缺失")?;
+                    let dir = raw_path;
                     for page in 1..=50 {
                         let u = Url::parse_with_params(
                             self.base.join("share/list")?.as_str(),
@@ -797,7 +1005,10 @@ impl Baidu {
                     count += 1;
                 }
             }
-            return Ok(json!({"required_bytes":bytes,"file_count":count}));
+            crate::review::finish_entries(&mut entries)?;
+            return Ok(
+                json!({"required_bytes":bytes,"file_count":count,"entries":entries,"roots":roots}),
+            );
         }
         let destination = format!("/FlowDisk分享/分享-{id}");
         for dir in ["/FlowDisk分享".to_owned(), destination.clone()] {
@@ -1264,6 +1475,18 @@ mod protocol_tests {
                 };
                 json!({"errno":0,"list":items})
             }
+            "/share/tplconfig" => {
+                assert_eq!(q["surl"], "1unitSHARE");
+                json!({"errno":0,"data":{"sign":"unit-preview-sign","timestamp":"123"}})
+            }
+            "/api/sharedownload" => {
+                assert_eq!(form["fid_list"], "[11]");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&form["extra"]).unwrap()["sekey"],
+                    "unit-share-cookie"
+                );
+                json!({"errno":0,"list":[{"dlink":"https://d.pcs.baidu.com/shared"}]})
+            }
             "/share/transfer" => {
                 assert_eq!(q["ondup"], "fail");
                 let items = s
@@ -1446,11 +1669,57 @@ mod protocol_tests {
             .inspect_share(Uuid::new_v4(), &share, "abcd")
             .await
             .unwrap();
-        assert_eq!(estimate, json!({"required_bytes":7,"file_count":3}));
+        assert_eq!(estimate["required_bytes"], 7);
+        assert_eq!(estimate["file_count"], 3);
+        assert_eq!(estimate["entries"].as_array().unwrap().len(), 4);
+        assert!(
+            estimate["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == "folder" && e["size"] == 4)
+        );
         assert_eq!(state.lock().await.transfers, 1); // Inspection never transfers files.
         let mixed_id = Uuid::new_v4();
         native.import_share(mixed_id, &share, "abcd").await.unwrap();
         native.import_share(mixed_id, &share, "abcd").await.unwrap();
+        assert_eq!(state.lock().await.transfers, 2);
+        let (link, thumbnail) = native
+            .share_preview_link(
+                mixed_id,
+                &share,
+                "abcd",
+                &format!("/share/{mixed_id}/folder/nested.bin"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(link.url.as_str(), "https://d.pcs.baidu.com/shared");
+        assert!(!thumbnail);
+        assert!(
+            native
+                .share_preview_link(
+                    mixed_id,
+                    &share,
+                    "abcd",
+                    &format!("/share/{mixed_id}/outside.bin")
+                )
+                .await
+                .is_err()
+        );
+        state.lock().await.share_items = Some(vec![
+            json!({"path":"/image.png","server_filename":"image.png","isdir":0,"size":3,"fs_id":15,"thumbs":{"url3":"https://thumbnail0.baidupcs.com/unit-image"}}),
+        ]);
+        let (link, thumbnail) = native
+            .share_preview_link(
+                mixed_id,
+                &share,
+                "abcd",
+                &format!("/share/{mixed_id}/image.png"),
+            )
+            .await
+            .unwrap();
+        assert!(thumbnail);
+        assert_eq!(link.url.host_str(), Some("thumbnail0.baidupcs.com"));
         assert_eq!(state.lock().await.transfers, 2);
         for size in [Value::Null, json!(-1), json!("not-a-size")] {
             let mut item = file("/invalid.bin", false, 14);

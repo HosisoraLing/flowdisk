@@ -36,9 +36,9 @@ pub struct Control {
 pub struct Share {
     id: Uuid,
     pub(crate) provider: String,
-    url: String,
+    pub(crate) url: String,
     #[serde(default)]
-    passcode: String,
+    pub(crate) passcode: String,
     pub(crate) status: String,
     pub(crate) message: String,
     pub(crate) jobs: Vec<Uuid>,
@@ -50,6 +50,8 @@ pub struct Share {
     pub(crate) capacity: Value,
     #[serde(default)]
     pub(crate) transfer_approved: bool,
+    #[serde(default)]
+    pub(crate) untransferred: bool,
     interaction: Option<Uuid>,
     created_at: u64,
 }
@@ -593,6 +595,7 @@ async fn add_share(
         entries: Vec::new(),
         capacity: Value::Null,
         transfer_approved: false,
+        untransferred: false,
         interaction: None,
         created_at: now(),
     };
@@ -787,7 +790,7 @@ async fn process_share(app: &App, id: Uuid) -> ApiResult<()> {
         .await?;
     // A preview may require a cloud copy. Show its space cost before submitting
     // that mutation; approval starts preparation, never a download job.
-    let mut reused = !s.jobs.is_empty() || !s.roots.is_empty();
+    let mut reused = !s.untransferred && (!s.jobs.is_empty() || !s.roots.is_empty());
     if reused && s.provider != "115" {
         let known = if s.roots.is_empty() {
             vec![format!(
@@ -866,6 +869,13 @@ async fn process_share(app: &App, id: Uuid) -> ApiResult<()> {
                 && current.status != "cancelled"
             {
                 current.capacity = capacity;
+                if storage["driver"] == "BaiduNative" {
+                    current.entries = serde_json::from_value(estimate["entries"].clone())
+                        .map_err(anyhow::Error::from)?;
+                    current.roots = serde_json::from_value(estimate["roots"].clone())
+                        .map_err(anyhow::Error::from)?;
+                    current.untransferred = true;
+                }
                 if insufficient || !s.transfer_approved {
                     current.status = if insufficient {
                         "insufficient_capacity"
@@ -875,6 +885,8 @@ async fn process_share(app: &App, id: Uuid) -> ApiResult<()> {
                     .into();
                     current.message = if insufficient {
                         "网盘容量不足，请先管理文件后重新检查"
+                    } else if current.untransferred {
+                        "可直接浏览分享和预览；下载时再确认转存"
                     } else {
                         "请查看容量，确认转存后即可浏览和预览文件"
                     }
@@ -968,6 +980,7 @@ async fn process_share(app: &App, id: Uuid) -> ApiResult<()> {
     {
         s.roots = paths;
         s.entries = entries;
+        s.untransferred = false;
         s.status = "ready".into();
         s.message = "内容已就绪，请预览并选择要下载的文件".into();
     }
